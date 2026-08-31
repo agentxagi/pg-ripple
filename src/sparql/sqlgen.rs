@@ -434,7 +434,7 @@ impl Fragment {
         }
     }
 
-    /// Return a fragment that produces exactly zero rows (for SILENT error cases).
+    /// Return a fragment that produces exactly zero rows.
     pub(crate) fn zero_rows() -> Self {
         Self {
             from_items: vec![("_zero".to_owned(), "(SELECT 1 LIMIT 0)".to_owned())],
@@ -602,22 +602,26 @@ pub(crate) fn translate_pattern(pattern: &GraphPattern, ctx: &mut Ctx) -> Fragme
             // node is properly registered in frag.bindings. Fragment::merge then
             // generates the JOIN condition (e.g. _t0.o = _t1.s) between the two
             // path subqueries, preventing an unintentional CROSS JOIN.
-            bgp::bind_term(
-                &alias,
-                "s",
-                subject,
-                ctx,
-                &mut frag.bindings,
-                &mut frag.conditions,
-            );
-            bgp::bind_term(
-                &alias,
-                "o",
-                object,
-                ctx,
-                &mut frag.bindings,
-                &mut frag.conditions,
-            );
+            if s_const.is_none() {
+                bgp::bind_term(
+                    &alias,
+                    "s",
+                    subject,
+                    ctx,
+                    &mut frag.bindings,
+                    &mut frag.conditions,
+                );
+            }
+            if o_const.is_none() {
+                bgp::bind_term(
+                    &alias,
+                    "o",
+                    object,
+                    ctx,
+                    &mut frag.bindings,
+                    &mut frag.conditions,
+                );
+            }
 
             frag
         }

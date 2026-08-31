@@ -15,6 +15,13 @@ fn encode_literal(sql: String) -> String {
     format!("pg_ripple.encode_term({sql}, 2::int2)")
 }
 
+#[pgrx::pg_extern(schema = "_pg_ripple", immutable, strict, parallel_safe)]
+fn sha1_hex(value: &str) -> String {
+    use sha1::Digest;
+
+    hex::encode(sha1::Sha1::digest(value.as_bytes()))
+}
+
 /// Translate a string SPARQL built-in function in value context.
 ///
 /// Returns `Some(sql)` for handled functions and `None` for all others.
@@ -364,9 +371,7 @@ pub(super) fn translate(
         Function::Sha1 => {
             let col = translate_arg_value(args.first()?, bindings, ctx)?;
             let text = decode_lexical_sql(&col);
-            Some(encode_literal(format!(
-                "encode(digest(({text})::bytea, 'sha1'), 'hex')"
-            )))
+            Some(encode_literal(format!("_pg_ripple.sha1_hex({text})")))
         }
         Function::Sha256 => {
             let col = translate_arg_value(args.first()?, bindings, ctx)?;
@@ -379,14 +384,14 @@ pub(super) fn translate(
             let col = translate_arg_value(args.first()?, bindings, ctx)?;
             let text = decode_lexical_sql(&col);
             Some(encode_literal(format!(
-                "encode(digest(({text})::bytea, 'sha384'), 'hex')"
+                "encode(sha384(({text})::bytea), 'hex')"
             )))
         }
         Function::Sha512 => {
             let col = translate_arg_value(args.first()?, bindings, ctx)?;
             let text = decode_lexical_sql(&col);
             Some(encode_literal(format!(
-                "encode(digest(({text})::bytea, 'sha512'), 'hex')"
+                "encode(sha512(({text})::bytea), 'hex')"
             )))
         }
 

@@ -1,4 +1,5 @@
 {
+  "artifact_digest": "uncomputed",
   "categories": {
     "aggregates": {
       "fail": 0,
@@ -109,13 +110,22 @@
       "xpass": 0
     }
   },
+  "duration_seconds": 1.3772918330000001,
+  "executed_total": 324,
+  "expected_total": 324,
   "failed": 0,
+  "git_sha": "unknown",
   "pass_rate_pct": "100.0",
   "passed": 324,
+  "pg_ripple_version": "0.136.0",
+  "postgres_version": "unknown",
   "skipped": 0,
+  "started_at": "unknown",
+  "suite": "w3c_sparql11",
+  "suite_commit": "unknown",
   "timeout": 0,
   "total": 324,
-  "version": "0.43.0",
+  "unexpected_failures": [],
   "xfail": 0,
   "xpass": 0
 }

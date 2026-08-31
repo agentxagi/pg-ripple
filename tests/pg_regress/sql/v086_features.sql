@@ -86,10 +86,8 @@ $$;
 
 -- ─── SC13-02: SERVICE SILENT behavior ───────────────────────────────────────
 
--- A SERVICE SILENT query against a non-existent endpoint should return empty
--- results rather than raising an error.
--- We use a known-unreachable endpoint and verify the query completes.
-SELECT count(*) = 0 AS service_silent_returns_empty
+-- A SERVICE SILENT error preserves the input solution rather than raising.
+SELECT count(*) = 1 AS service_silent_preserves_input
 FROM pg_ripple.sparql(
     'SELECT ?s WHERE { SERVICE SILENT <http://localhost:1/doesnotexist/sparql> { ?s ?p ?o } }'
 );

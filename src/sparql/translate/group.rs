@@ -353,21 +353,11 @@ fn rdf_numeric_agg(agg_fn: &str, distinct_kw: &str, arg: &str, is_avg: bool) -> 
         "CASE WHEN ({arg}) IS NULL THEN NULL \
          WHEN ({arg}) < 0 THEN \
            ((({arg}) & 72057594037927935::bigint) - 36028797018963968::bigint)::numeric \
-         ELSE (SELECT CASE WHEN d.datatype IN (\
-           'http://www.w3.org/2001/XMLSchema#decimal',\
-           'http://www.w3.org/2001/XMLSchema#double',\
-           'http://www.w3.org/2001/XMLSchema#float',\
-           'http://www.w3.org/2001/XMLSchema#integer') \
-           THEN d.value::numeric ELSE NULL END \
-           FROM _pg_ripple.dictionary d WHERE d.id = ({arg}) LIMIT 1) END"
+         ELSE pg_ripple.decode_numeric_spi(({arg})) END"
     );
     let tc = format!(
         "CASE WHEN ({arg}) IS NULL OR ({arg}) < 0 THEN 0 \
-         ELSE COALESCE((SELECT CASE \
-           WHEN d.datatype IN ('http://www.w3.org/2001/XMLSchema#double',\
-                               'http://www.w3.org/2001/XMLSchema#float') THEN 2 \
-           WHEN d.datatype = 'http://www.w3.org/2001/XMLSchema#integer' THEN 0 \
-           ELSE 1 END FROM _pg_ripple.dictionary d WHERE d.id = ({arg}) LIMIT 1), 0) END"
+         ELSE COALESCE(pg_ripple.numeric_type_code_spi(({arg})), 0) END"
     );
     if is_avg {
         format!(

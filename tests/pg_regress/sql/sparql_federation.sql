@@ -74,8 +74,7 @@ END $$;
 
 SELECT 'unregistered endpoint raises error' AS ssrf_protection_check;
 
--- SERVICE SILENT on unregistered endpoint must return empty (no error).
--- With SILENT, a warning is emitted and results are empty.
+-- SERVICE SILENT on an error preserves the input solution (no error).
 SELECT COUNT(*) AS silent_unregistered_count
 FROM pg_ripple.sparql(
     'SELECT ?s WHERE { SERVICE SILENT <http://also-unregistered.test/sparql> { ?s ?p ?o } }'
@@ -175,7 +174,7 @@ BEGIN
 END $$;
 
 -- Second call with SERVICE SILENT — circuit-breaker is open (PT605).
--- SILENT must return empty results, not raise an error.
+-- SILENT preserves the input solution, with ?s unbound.
 SELECT pg_ripple.sparql(
     'SELECT ?s WHERE { SERVICE SILENT <http://cb-silent.test/sparql> { ?s ?p ?o } }'
 ) AS silent_cb_result;
