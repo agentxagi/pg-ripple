@@ -179,6 +179,27 @@ mod pg_ripple {
         crate::datalog::derivations::justify_impl(subject, predicate, object).map(pgrx::JsonB)
     }
 
+    /// Graph-scoped variant of `justify()`: the proof tree (root fact and
+    /// every antecedent, at every depth) is built only from the named graph
+    /// supplied, reading the same storages the SPARQL engine's
+    /// `GRAPH <g>` evaluation reads (`vp_rare`, promoted `vp_{id}` views,
+    /// delta).
+    ///
+    /// Returns `NULL` when the graph IRI is unknown, the triple is not in the
+    /// graph, or its recorded proof cannot be completed inside the graph
+    /// (some antecedent lives outside it).  The original 3-arg `justify()`
+    /// keeps its graph-blind global semantics for backward compatibility.
+    #[pg_extern(name = "justify")]
+    fn justify_in_graph(
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        graph: &str,
+    ) -> Option<pgrx::JsonB> {
+        crate::datalog::derivations::justify_in_graph_impl(subject, predicate, object, graph)
+            .map(pgrx::JsonB)
+    }
+
     /// Remove orphan rows from `_pg_ripple.derivations` — rows whose `derived_sid`
     /// no longer exists in `_pg_ripple.vp_rare`.
     ///

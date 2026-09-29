@@ -9,6 +9,23 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+### Added
+
+- **`justify(subject, predicate, object, graph)` — graph-scoped proof trees.**
+  The 3-arg `justify()` is graph-blind: `sid_for_triple` matches across every
+  named graph and antecedents are expanded without checking where they live,
+  which with per-tenant named graphs is a cross-tenant leak (existence oracle
+  plus foreign proof trees). The 4-arg overload resolves the graph IRI the
+  same way `insert_triple` does, finds the root SID reading the same storages
+  the SPARQL engine's `GRAPH` evaluation reads (`vp_rare`, promoted `vp_{id}`
+  views), and validates every antecedent against the graph while building the
+  tree; a derivation whose proof reaches outside the graph is dropped, and if
+  no derivation survives the function returns NULL instead of a partial tree.
+  The 3-arg signature keeps its legacy global semantics. Pinned by
+  `tests/pg_regress/sql/justify_graph.sql` (two-tenant suite). Ships with the
+  `0.128.0 → 0.129.0` upgrade script registering the overload on existing
+  installs.
+
 ### Fixed
 
 - **`drain_dead_letter_queue()` deleted one row, not the queue.** It used
