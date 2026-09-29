@@ -257,10 +257,15 @@ pub fn run_inference_seminaive(rule_set_name: &str) -> (i64, i32) {
 
     let mut total_derived: i64 = 0;
     for &pred_id in &derived_pred_ids {
+        // v0.129.0 CONFLICT-03: materialise as inferred (source = 1) so that
+        // rule_conflicts('runtime'), DRed retraction and justify() can tell
+        // derived rows apart from asserted ones. ON CONFLICT DO NOTHING keeps
+        // an asserted (source = 0) row intact when the same triple was also
+        // derivable.
         let cnt = Spi::get_one::<i64>(&format!(
             "WITH ins AS ( \
-               INSERT INTO _pg_ripple.vp_rare (p, s, o, g) \
-               SELECT {pred_id}::bigint, s, o, g FROM _dl_delta_{pred_id} \
+               INSERT INTO _pg_ripple.vp_rare (p, s, o, g, source) \
+               SELECT {pred_id}::bigint, s, o, g, 1 FROM _dl_delta_{pred_id} \
                ON CONFLICT DO NOTHING RETURNING 1 \
              ) SELECT COUNT(*)::bigint FROM ins"
         ))
@@ -875,9 +880,11 @@ pub(crate) fn run_seminaive_inner(rules: &[Rule], rule_set_name: &str) -> (i64, 
 
     let mut total: i64 = 0;
     for &pred_id in &derived_pred_ids {
+        // v0.129.0 CONFLICT-03: materialise as inferred (source = 1); see the
+        // matching comment in run_inference_seminaive.
         let cnt = Spi::get_one::<i64>(&format!(
-            "WITH ins AS (INSERT INTO _pg_ripple.vp_rare (p, s, o, g) \
-             SELECT {pred_id}::bigint, s, o, g FROM _dl_delta_{pred_id} \
+            "WITH ins AS (INSERT INTO _pg_ripple.vp_rare (p, s, o, g, source) \
+             SELECT {pred_id}::bigint, s, o, g, 1 FROM _dl_delta_{pred_id} \
              ON CONFLICT DO NOTHING RETURNING 1) SELECT COUNT(*)::bigint FROM ins"
         ))
         .unwrap_or(None)

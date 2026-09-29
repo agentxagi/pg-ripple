@@ -402,10 +402,12 @@ fn wfs_non_stratifiable(_rule_set_name: &str, all_rules: &[Rule]) -> (i64, i64, 
     // ── Materialise CERTAIN facts into vp_rare ────────────────────────────────
     for &pid in &derived {
         let pos_tbl = format!("_wfs_pos_{pid}");
+        // v0.129.0 CONFLICT-03: materialise as inferred (source = 1); see the
+        // matching comment in run_inference_seminaive.
         let cnt = Spi::get_one::<i64>(&format!(
             "WITH ins AS ( \
-               INSERT INTO _pg_ripple.vp_rare (p, s, o, g) \
-               SELECT {pid}::bigint, s, o, g FROM {pos_tbl} \
+               INSERT INTO _pg_ripple.vp_rare (p, s, o, g, source) \
+               SELECT {pid}::bigint, s, o, g, 1 FROM {pos_tbl} \
                ON CONFLICT DO NOTHING \
                RETURNING 1 \
              ) SELECT COUNT(*)::bigint FROM ins"

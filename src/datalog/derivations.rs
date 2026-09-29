@@ -238,10 +238,11 @@ fn compile_antecedent_insert(rule: &super::Rule, rule_set: &str) -> Option<Strin
 ///
 /// Uses the delta temp-table returned by `delta_table_fn(head_pred)` — which
 /// contains only the (s, o, g) rows newly derived in this inference run — to
-/// join against `vp_rare` and obtain the correct SIDs.  This is required
-/// because derived triples are stored with `source = 0` (DEFAULT), not
-/// `source = 1`, so the `source = 1` filter in `compile_antecedent_insert`
-/// would always return zero rows.
+/// join against `vp_rare` and obtain the correct SIDs.  Since v0.129.0
+/// (CONFLICT-03) materialised triples carry `source = 1`, so the base
+/// variant's `source = 1` filter matches too; this variant remains the
+/// preferred path during semi-naive recording because it restricts the join
+/// to rows actually derived by this run instead of rescanning `vp_rare`.
 ///
 /// Returns `None` when:
 /// - `delta_table_fn` returns `None` for the head predicate (no delta context)

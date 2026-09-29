@@ -47,6 +47,21 @@ mod pg_ripple {
     fn infer_with_stats(rule_set: default!(&str, "'custom'")) -> pgrx::JsonB {
         let (derived, iterations, eliminated, parallel_groups, max_concurrent) =
             crate::datalog::run_inference_seminaive_full(rule_set);
+        // v0.129.0 CONFLICT-03: gate parity with infer() — run the same runtime
+        // conflict post-check when block_on_conflict is on, so the semi-naive
+        // path halts on contradictions (PT0451) exactly like the plain path.
+        if crate::BLOCK_ON_CONFLICT.get() {
+            let conflicts = crate::datalog::rule_conflicts(rule_set, "runtime");
+            if let Some(arr) = conflicts.as_array()
+                && !arr.is_empty()
+            {
+                pgrx::error!(
+                    "inference halted: rule conflict detected in ruleset '{}' \
+                     (set pg_ripple.block_on_conflict = off to continue despite conflicts) (PT0451)",
+                    rule_set
+                );
+            }
+        }
         let mut obj = serde_json::Map::new();
         obj.insert(
             "derived".to_owned(),

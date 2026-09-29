@@ -610,10 +610,12 @@ fn run_magic_seminaive(
     // Materialise derived triples into vp_rare.
     let mut total_derived = 0i64;
     for &pred_id in &derived_pred_ids {
+        // v0.129.0 CONFLICT-03: materialise as inferred (source = 1); see the
+        // matching comment in run_inference_seminaive.
         let cnt = pgrx::Spi::get_one::<i64>(&format!(
             "WITH ins AS ( \
-               INSERT INTO _pg_ripple.vp_rare (p, s, o, g) \
-               SELECT {pred_id}::bigint, s, o, g FROM _dl_delta_{pred_id} \
+               INSERT INTO _pg_ripple.vp_rare (p, s, o, g, source) \
+               SELECT {pred_id}::bigint, s, o, g, 1 FROM _dl_delta_{pred_id} \
                ON CONFLICT DO NOTHING \
                RETURNING 1 \
              ) SELECT COUNT(*)::bigint FROM ins"
