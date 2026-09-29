@@ -58,6 +58,9 @@ SELECT pg_ripple.load_rules_builtin('rdfs') > 0 AS rdfs_loaded_on;
 SELECT (pg_ripple.infer_with_stats('rdfs')->>'derived')::bigint >= 0
     AS derived_nonneg_on;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  derived_nonneg_on 
 -------------------
  t
@@ -82,6 +85,9 @@ SELECT pg_ripple.load_rules_builtin('rdfs') > 0 AS rdfs_loaded_off;
 
 SELECT (pg_ripple.infer_with_stats('rdfs')->>'derived')::bigint >= 0
     AS derived_nonneg_off;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  derived_nonneg_off 
 --------------------

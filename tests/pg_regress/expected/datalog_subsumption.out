@@ -22,6 +22,9 @@ WARNING:  pg_ripple: loaded without shared_preload_libraries; HTAP merge worker,
 SELECT jsonb_typeof(pg_ripple.infer_with_stats('rdfs')) = 'object'
     AS result_is_object;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  result_is_object 
 ------------------
  t
@@ -30,6 +33,9 @@ WARNING:  semi-naive rule compile error: variable predicate in rule body not sup
 -- 2. eliminated_rules key is present (may be empty array).
 SELECT pg_ripple.infer_with_stats('rdfs') ? 'eliminated_rules'
     AS has_eliminated_rules;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  has_eliminated_rules 
 ----------------------
@@ -40,6 +46,9 @@ WARNING:  semi-naive rule compile error: variable predicate in rule body not sup
 SELECT jsonb_typeof(pg_ripple.infer_with_stats('rdfs')->'eliminated_rules') = 'array'
     AS eliminated_is_array;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  eliminated_is_array 
 ---------------------
  t
@@ -48,12 +57,18 @@ WARNING:  semi-naive rule compile error: variable predicate in rule body not sup
 -- 4. Standard keys still present after v0.29.0 change.
 SELECT pg_ripple.infer_with_stats('rdfs') ? 'derived'    AS has_derived;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  has_derived 
 -------------
  t
 (1 row)
 
 SELECT pg_ripple.infer_with_stats('rdfs') ? 'iterations' AS has_iterations;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  has_iterations 
 ----------------

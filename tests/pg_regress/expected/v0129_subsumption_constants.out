@@ -1,0 +1,261 @@
+-- v0.129.0 Regression Tests
+-- Tests for: check_subsumption() compares full atoms, not just predicate IDs
+--            (VAL-211 — rules differing only in constants are no longer
+--            eliminated, and elimination no longer removes every copy of a
+--            duplicated rule).
+--
+-- Covers:
+--   SUBS-1: two rules with the same head and the same body predicate that
+--           differ only in body constants both fire at fixpoint
+--           (pre-fix: one side was eliminated as "subsumed")
+--   SUBS-2: rule_conflicts(rs, 'runtime') sees both derivations
+--           (pre-fix: [] — the conflicting derivation never existed)
+--   SUBS-3: block_on_conflict = on raises PT0451 for the constant-only pair
+--   SUBS-4: a genuinely duplicated rule keeps one copy and still fires
+--           (pre-fix: the text filter dropped every copy — derived = 0)
+--   SUBS-5: exact duplicates and genuinely subsumed rules are still reported
+--           in eliminated_rules (dedup preserved)
+-- Namespace: https://val211.test/
+-- The "loaded without shared_preload_libraries" WARNING is emitted either at
+-- CREATE EXTENSION or at LOAD depending on whether the library was already
+-- loaded in this session — suppress it so the expected output is order-stable.
+SET client_min_messages = error;
+CREATE EXTENSION IF NOT EXISTS pg_ripple;
+SET search_path TO pg_ripple, public;
+-- Load library so _PG_init registers GUCs (required when shared_preload_libraries is not set).
+LOAD '$libdir/pg_ripple';
+-- NOTICEs from ensure_catalog depend on whether the catalog was created by an
+-- earlier test in the suite — keep them out of the expected output.
+SET client_min_messages = warning;
+-- Provenance recording is required for the runtime conflict scan.
+SET pg_ripple.record_derivations = on;
+-- Baseline for suite hygiene: only rows inserted by this file are cleaned up.
+CREATE TEMP TABLE _sub_test_baseline AS
+    SELECT COALESCE(MAX(i), 0) AS max_i FROM _pg_ripple.vp_rare;
+-- Helper: run a statement, swallow errors, return SQLERRM (or 'no_error').
+CREATE FUNCTION pg_temp.catch_error(stmt TEXT) RETURNS TEXT AS $$
+DECLARE
+    err TEXT;
+BEGIN
+    BEGIN
+        EXECUTE stmt;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN SQLERRM;
+    END;
+    RETURN 'no_error';
+END;
+$$ LANGUAGE plpgsql;
+-- ══════════════════════════════════════════════════════════════════════════════
+-- SUBS-1 / SUBS-2 / SUBS-3: same head, same body predicate, constants only.
+-- ══════════════════════════════════════════════════════════════════════════════
+SELECT pg_ripple.drop_rules('sub_conflict') >= 0 AS sub_conflict_rules_dropped;
+ sub_conflict_rules_dropped 
+----------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val211.test/flag> "yes" :- ?x <https://val211.test/trigger> "A" .
+     ?x <https://val211.test/flag> "no"  :- ?x <https://val211.test/trigger> "B" .',
+    'sub_conflict'
+) = 2 AS sub_conflict_rules_loaded;
+ sub_conflict_rules_loaded 
+---------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val211.test/Bob>',
+    '<https://val211.test/trigger>',
+    '"A"'
+) >= 1 AS sub_conflict_trigger_a_inserted;
+ sub_conflict_trigger_a_inserted 
+---------------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val211.test/Bob>',
+    '<https://val211.test/trigger>',
+    '"B"'
+) >= 1 AS sub_conflict_trigger_b_inserted;
+ sub_conflict_trigger_b_inserted 
+---------------------------------
+ t
+(1 row)
+
+CREATE TEMP TABLE _sub_conflict_stats AS
+    SELECT pg_ripple.infer_with_stats('sub_conflict') AS stats;
+-- Neither rule may be eliminated (pre-fix: the "no" rule was reported).
+SELECT stats -> 'eliminated_rules' = '[]'::jsonb
+    AS sub_conflict_no_rules_eliminated
+FROM _sub_conflict_stats;
+ sub_conflict_no_rules_eliminated 
+----------------------------------
+ t
+(1 row)
+
+-- Both conflicting facts materialise (pre-fix: only the first rule fired).
+SELECT (stats ->> 'derived')::bigint >= 2
+    AS sub_conflict_both_sides_derived
+FROM _sub_conflict_stats;
+ sub_conflict_both_sides_derived 
+---------------------------------
+ t
+(1 row)
+
+SELECT count(*) = 2 AS sub_conflict_two_facts_in_vp_rare
+FROM _pg_ripple.vp_rare
+WHERE p = (SELECT id FROM _pg_ripple.dictionary
+           WHERE value = 'https://val211.test/flag')
+  AND source = 1;
+ sub_conflict_two_facts_in_vp_rare 
+-----------------------------------
+ t
+(1 row)
+
+-- The runtime scan joins both derivations and must report the contradiction.
+SELECT jsonb_array_length(pg_ripple.rule_conflicts('sub_conflict', 'runtime')) > 0
+    AS sub_conflict_runtime_scan_detects;
+ sub_conflict_runtime_scan_detects 
+-----------------------------------
+ t
+(1 row)
+
+-- With the pair present, the conflict gate fires (same PT0451 as VAL-197).
+SET pg_ripple.block_on_conflict = on;
+SELECT pg_temp.catch_error(
+    'SELECT pg_ripple.infer_with_stats(''sub_conflict'')'
+) LIKE '%PT0451%' AS sub_conflict_gate_raises_pt0451;
+ sub_conflict_gate_raises_pt0451 
+---------------------------------
+ t
+(1 row)
+
+SET pg_ripple.block_on_conflict = off;
+-- ══════════════════════════════════════════════════════════════════════════════
+-- SUBS-4: genuinely duplicated rule — one copy must survive elimination.
+-- ══════════════════════════════════════════════════════════════════════════════
+SELECT pg_ripple.drop_rules('sub_dup') >= 0 AS sub_dup_rules_dropped;
+ sub_dup_rules_dropped 
+-----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val211.test/tag> "dup" :- ?x <https://val211.test/base2> "1" .
+     ?x <https://val211.test/tag> "dup" :- ?x <https://val211.test/base2> "1" .',
+    'sub_dup'
+) = 2 AS sub_dup_rules_loaded;
+ sub_dup_rules_loaded 
+----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val211.test/Carol>',
+    '<https://val211.test/base2>',
+    '"1"'
+) >= 1 AS sub_dup_base_inserted;
+ sub_dup_base_inserted 
+-----------------------
+ t
+(1 row)
+
+CREATE TEMP TABLE _sub_dup_stats AS
+    SELECT pg_ripple.infer_with_stats('sub_dup') AS stats;
+-- The duplicate is reported exactly once (one copy eliminated).
+SELECT jsonb_array_length(stats -> 'eliminated_rules') = 1
+    AS sub_dup_one_copy_eliminated
+FROM _sub_dup_stats;
+ sub_dup_one_copy_eliminated 
+-----------------------------
+ t
+(1 row)
+
+-- The rule still fires (pre-fix: every copy was dropped — derived = 0).
+SELECT (stats ->> 'derived')::bigint >= 1
+    AS sub_dup_rule_still_fires
+FROM _sub_dup_stats;
+ sub_dup_rule_still_fires 
+--------------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS sub_dup_fact_in_vp_rare
+FROM _pg_ripple.vp_rare
+WHERE p = (SELECT id FROM _pg_ripple.dictionary
+           WHERE value = 'https://val211.test/tag')
+  AND source = 1;
+ sub_dup_fact_in_vp_rare 
+-------------------------
+ t
+(1 row)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- SUBS-5: exact duplicates and genuine subsumption still reported.
+-- ══════════════════════════════════════════════════════════════════════════════
+SELECT pg_ripple.drop_rules('sub_gen') >= 0 AS sub_gen_rules_dropped;
+ sub_gen_rules_dropped 
+-----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val211.test/general> ?y :- ?x <https://val211.test/base3> ?y .
+     ?x <https://val211.test/general> ?y :- ?x <https://val211.test/base3> ?y , ?x <https://val211.test/extra> ?z .',
+    'sub_gen'
+) = 2 AS sub_gen_rules_loaded;
+ sub_gen_rules_loaded 
+----------------------
+ t
+(1 row)
+
+-- The second rule (extra body condition, same head) is genuinely subsumed.
+SELECT jsonb_array_length(pg_ripple.infer_with_stats('sub_gen') -> 'eliminated_rules') = 1
+    AS sub_gen_subsumed_rule_still_reported;
+ sub_gen_subsumed_rule_still_reported 
+--------------------------------------
+ t
+(1 row)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Cleanup — keep the suite namespace-clean for the other tests.
+-- ══════════════════════════════════════════════════════════════════════════════
+SET pg_ripple.record_derivations = off;
+SET pg_ripple.block_on_conflict = off;
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT p.id
+        FROM _pg_ripple.predicates p
+        JOIN _pg_ripple.dictionary d ON d.id = p.id
+        WHERE d.value LIKE 'https://val211.test/%'
+    LOOP
+        EXECUTE format('DELETE FROM _pg_ripple.vp_rare WHERE p = %s', r.id);
+    END LOOP;
+
+    DELETE FROM _pg_ripple.derivations
+    WHERE rule_set IN ('sub_conflict', 'sub_dup', 'sub_gen');
+END;
+$$;
+SELECT pg_ripple.drop_rules('sub_conflict') >= 0 AS sub_conflict_cleanup;
+ sub_conflict_cleanup 
+----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.drop_rules('sub_dup') >= 0 AS sub_dup_cleanup;
+ sub_dup_cleanup 
+-----------------
+ t
+(1 row)
+
+SELECT pg_ripple.drop_rules('sub_gen') >= 0 AS sub_gen_cleanup;
+ sub_gen_cleanup 
+-----------------
+ t
+(1 row)
+

@@ -17,6 +17,29 @@ use super::{
     compile_single_rule_to, has_variable_pred, parse_rules, vp_read_expr_pub,
 };
 
+/// Remove eliminated rules, dropping exactly one rule instance per returned
+/// text.  `check_subsumption` reports the `rule_text` of each eliminated rule
+/// occurrence, so a genuinely duplicated rule keeps its first copy here — a
+/// plain text-set filter removed every copy at once and silently disabled the
+/// rule entirely (v0.129.0).
+fn filter_subsumed(all_rules: &[Rule], eliminated: &[String]) -> Vec<Rule> {
+    let mut to_drop: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for text in eliminated {
+        *to_drop.entry(text.as_str()).or_insert(0) += 1;
+    }
+    all_rules
+        .iter()
+        .filter(|r| match to_drop.get_mut(r.rule_text.as_str()) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                false
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect()
+}
+
 // ─── Main semi-naive inference entry point ───────────────────────────────────
 
 /// Execute on-demand materialization using semi-naive evaluation.
@@ -92,13 +115,7 @@ pub fn run_inference_seminaive(rule_set_name: &str) -> (i64, i32) {
     let active_rules: Vec<Rule> = if eliminated_rules.is_empty() {
         all_rules.clone()
     } else {
-        let eliminated_set: std::collections::HashSet<&str> =
-            eliminated_rules.iter().map(|s| s.as_str()).collect();
-        all_rules
-            .iter()
-            .filter(|r| !eliminated_set.contains(r.rule_text.as_str()))
-            .cloned()
-            .collect()
+        filter_subsumed(&all_rules, &eliminated_rules)
     };
 
     for &pred_id in &derived_pred_ids {

@@ -25,6 +25,9 @@ WARNING:  pg_ripple: loaded without shared_preload_libraries; HTAP merge worker,
 -- 1. infer_with_stats returns JSONB with expected keys.
 SELECT jsonb_typeof(pg_ripple.infer_with_stats('rdfs')) = 'object' AS result_is_object;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  result_is_object 
 ------------------
  t
@@ -32,12 +35,18 @@ WARNING:  semi-naive rule compile error: variable predicate in rule body not sup
 
 SELECT (pg_ripple.infer_with_stats('rdfs') ? 'derived')    AS has_derived_key;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  has_derived_key 
 -----------------
  t
 (1 row)
 
 SELECT (pg_ripple.infer_with_stats('rdfs') ? 'iterations') AS has_iterations_key;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  has_iterations_key 
 --------------------
@@ -47,6 +56,9 @@ WARNING:  semi-naive rule compile error: variable predicate in rule body not sup
 -- 2. derived count is a non-negative integer.
 SELECT (pg_ripple.infer_with_stats('rdfs')->>'derived')::bigint >= 0 AS derived_nonneg;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  derived_nonneg 
 ----------------
  t
@@ -55,6 +67,9 @@ WARNING:  semi-naive rule compile error: variable predicate in rule body not sup
 -- 3. iterations count is >= 1.
 --   Semi-naive evaluation always performs at least one seeding pass.
 SELECT (pg_ripple.infer_with_stats('rdfs')->>'iterations')::int >= 1 AS iterations_at_least_one;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  iterations_at_least_one 
 -------------------------
@@ -96,6 +111,9 @@ SELECT pg_ripple.insert_triple(
 -- Run semi-naive inference; the transitive closure should derive A<=C, A<=D, B<=D.
 SELECT (pg_ripple.infer_with_stats('rdfs')->>'derived')::bigint >= 0 AS derived_after_chain;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  derived_after_chain 
 ---------------------
  t
@@ -103,6 +121,9 @@ WARNING:  semi-naive rule compile error: variable predicate in rule body not sup
 
 -- 5. Verify infer_with_stats result type (robustness check).
 SELECT pg_typeof(pg_ripple.infer_with_stats('rdfs')) = 'jsonb'::regtype AS returns_jsonb;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  returns_jsonb 
 ---------------
