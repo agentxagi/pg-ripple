@@ -8,10 +8,12 @@
 --   SRC-GATE-2: rule_conflicts(rs, 'runtime') detects the contradiction
 --   SRC-GATE-3: block_on_conflict = on raises PT0451 in infer_with_stats()
 --   SRC-GATE-4: dedicated-VP predicates (e.g. depends_on in production) are
---               covered — derived rows land in vp_rare with source = 1
---   SRC-GATE-5: plain infer() alone keeps PT0451 inert (it records no
---               derivations; depends on VAL-187 option (A) — see ADR-059)
---   SRC-GATE-6: plain infer() gate fires once provenance exists (parity proof)
+--               covered — derived rows land in the canonical {vp}_delta with
+--               source = 1 (v0.130.0 VAL-207 CANON-TARGET)
+--   SRC-GATE-5: with plain-path provenance shipped (VAL-207 option A), the
+--               gate on the production write path is live: infer() raises
+--               PT0451 on its own recorded conflicts; without recording the
+--               gate stays inert
 --   SRC-GATE-7: remove_rule() retracts derived facts (DELETE ... source = 1)
 --
 -- NOTE: the conflicting rules below use distinct body predicates on purpose.
@@ -47,6 +49,19 @@ BEGIN
         RETURN SQLERRM;
     END;
     RETURN 'no_error';
+END;
+$$ LANGUAGE plpgsql;
+
+-- Helper: rows of a predicate's promoted delta table with source = 1.
+CREATE FUNCTION pg_temp.delta_inferred_count(pred TEXT) RETURNS BIGINT AS $$
+DECLARE
+    n BIGINT;
+    p_id BIGINT;
+BEGIN
+    SELECT id INTO p_id FROM _pg_ripple.dictionary WHERE value = pred LIMIT 1;
+    EXECUTE format('SELECT count(*) FROM _pg_ripple.vp_%s_delta WHERE source = 1', p_id)
+    INTO n;
+    RETURN n;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -141,12 +156,10 @@ SELECT pg_ripple.insert_triple(
 SELECT (pg_ripple.infer_with_stats('sg_dep') ->> 'derived')::bigint >= 2
     AS sg_dep_stats_derived_conflicting_pair;
 
--- Derived rows for the dedicated-VP predicate live in vp_rare with source = 1.
-SELECT count(*) = 2 AS sg_dep_derived_rows_have_source_1
-FROM _pg_ripple.vp_rare
-WHERE p = (SELECT id FROM _pg_ripple.dictionary
-           WHERE value = 'https://val197.test/depends_on')
-  AND source = 1;
+-- Derived rows for the dedicated-VP predicate land in the canonical
+-- {vp}_delta with source = 1 — no second vp_rare copy (v0.130.0 VAL-207).
+SELECT pg_temp.delta_inferred_count('https://val197.test/depends_on') = 2
+    AS sg_dep_derived_rows_have_source_1;
 
 SELECT jsonb_array_length(pg_ripple.rule_conflicts('sg_dep', 'runtime')) > 0
     AS sg_dep_runtime_scan_detects_conflict;
@@ -187,12 +200,13 @@ SELECT pg_temp.catch_error(
 SET pg_ripple.block_on_conflict = off;
 
 -- ══════════════════════════════════════════════════════════════════════════════
--- SRC-GATE-5: plain infer() alone keeps PT0451 inert.
+-- SRC-GATE-5: the gate on the production write path is live.
 --
--- The plain path materialises into the dedicated VP delta tables and records
--- nothing in _pg_ripple.derivations, so the runtime scan has no provenance to
--- join.  This is EXPECTED and documented in ADR-059: reactivating the gate on
--- the production write path depends on VAL-187 option (A), pending decision.
+-- With plain-path provenance shipped (v0.130.0, VAL-207 option A — see
+-- ADR-059 item 4), infer() records the conflict it derives and its own
+-- post-check raises PT0451 under block_on_conflict = on.  Without recording
+-- (record_derivations = off) there is no provenance for the scan to join and
+-- the gate stays inert.
 -- ══════════════════════════════════════════════════════════════════════════════
 
 SELECT pg_ripple.drop_rules('sg_plain') >= 0 AS sg_plain_rules_dropped;
@@ -217,28 +231,43 @@ SELECT pg_ripple.insert_triple(
 
 SET pg_ripple.block_on_conflict = on;
 
--- No PT0451: the plain path records no derivations for the scan to join.
-SELECT pg_temp.catch_error('SELECT pg_ripple.infer(''sg_plain'')') = 'no_error'
-    AS sg_plain_infer_gate_inert_without_provenance;
+-- The plain path records its own provenance now, so the gate fires.
+SELECT pg_temp.catch_error('SELECT pg_ripple.infer(''sg_plain'')') LIKE '%PT0451%'
+    AS sg_plain_infer_gate_raises_pt0451;
 
--- And the scan stays empty on its own.
-SELECT jsonb_array_length(pg_ripple.rule_conflicts('sg_plain', 'runtime')) = 0
-    AS sg_plain_runtime_scan_empty_without_provenance;
-
--- ══════════════════════════════════════════════════════════════════════════════
--- SRC-GATE-6: once provenance exists (semi-naive run below), the plain gate
--- fires — proving the infer() post-check itself is correct.
--- ══════════════════════════════════════════════════════════════════════════════
-
+SET pg_ripple.record_derivations = off;
 SET pg_ripple.block_on_conflict = off;
 
-SELECT (pg_ripple.infer_with_stats('sg_plain') ->> 'derived')::bigint >= 2
-    AS sg_plain_stats_populates_provenance;
+-- Without recording, a fresh ruleset runs clean and the scan stays empty.
+SELECT pg_ripple.drop_rules('sg_plain_norec') >= 0 AS sg_plain_norec_rules_dropped;
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val197.test/state> "on"  :- ?x <https://val197.test/input_a> "a" .
+     ?x <https://val197.test/state> "off" :- ?x <https://val197.test/input_b> "b" .',
+    'sg_plain_norec'
+) = 2 AS sg_plain_norec_rules_loaded;
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Node5>',
+    '<https://val197.test/input_a>',
+    '"a"'
+) >= 1 AS sg_plain_norec_input_a_inserted;
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Node5>',
+    '<https://val197.test/input_b>',
+    '"b"'
+) >= 1 AS sg_plain_norec_input_b_inserted;
 
 SET pg_ripple.block_on_conflict = on;
 
-SELECT pg_temp.catch_error('SELECT pg_ripple.infer(''sg_plain'')')
-    LIKE '%PT0451%' AS sg_plain_infer_gate_fires_with_provenance;
+-- No PT0451: the plain path records no derivations for the scan to join.
+SELECT pg_temp.catch_error('SELECT pg_ripple.infer(''sg_plain_norec'')') = 'no_error'
+    AS sg_plain_infer_gate_inert_without_provenance;
+
+-- And the scan stays empty on its own.
+SELECT jsonb_array_length(pg_ripple.rule_conflicts('sg_plain_norec', 'runtime')) = 0
+    AS sg_plain_runtime_scan_empty_without_provenance;
 
 SET pg_ripple.block_on_conflict = off;
 

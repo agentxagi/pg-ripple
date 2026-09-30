@@ -1,0 +1,19 @@
+-- Migration 0.129.0 → 0.130.0: plain-path provenance + canonical materialisation
+-- (VAL-207, option A).
+--
+-- No SQL-level schema changes: the new behaviour is compiled into the shared
+-- library.  ALTER EXTENSION pg_ripple UPDATE picks up the new .so and keeps
+-- every existing object.
+--
+--   PROOF-TREE-02: pg_ripple.infer() (plain path) records derivation
+--     provenance when pg_ripple.record_derivations = on — previously only the
+--     semi-naive fixpoint (infer_with_stats / infer_goal / infer_wfs) recorded.
+--   MARK-INFERRED: plain-path INSERTs into {vp}_delta carry source = 1, the
+--     same provenance class as the fixpoint (CONFLICT-03), so runtime conflict
+--     detection, DRed retraction and justification treat both paths alike.
+--   CANON-TARGET: semi-naive / magic-sets / WFS materialisation for promoted
+--     predicates writes the canonical {vp}_delta (source = 1) instead of a
+--     second vp_rare copy — no more double materialisation with distinct SIDs.
+--   JUSTIFY-DELTA: justify()'s SID lookups (3-arg and 4-arg) resolve facts in
+--     {vp}_delta/main through the promoted vp_{id} views; the runtime conflict
+--     scan and inference explain read the same canonical storages.

@@ -13,6 +13,7 @@ pub(super) fn compile_recursive_rule(
     head_pred: i64,
     _head_g_expr: &str,
     target: &str,
+    mark_inferred: bool,
 ) -> Result<String, String> {
     let head = rule
         .head
@@ -160,6 +161,13 @@ pub(super) fn compile_recursive_rule(
         let rec_sql_depth = rec_sql.replacen("base.g", "base.g, r.depth + 1 AS depth", 1);
         let rec_sql_depth = format!("{rec_sql_depth}\nWHERE r.depth < {max_depth}");
 
+        // VAL-207: plain-path (mark_inferred) INSERTs carry source = 1.
+        let (head_cols, head_source) = if mark_inferred {
+            ("s, o, g, source", ", 1")
+        } else {
+            ("s, o, g", "")
+        };
+
         Ok(format!(
             "WITH RECURSIVE {cte_name}(s, o, g, depth) AS (\n\
                  {base_sql_depth}\n\
@@ -167,13 +175,20 @@ pub(super) fn compile_recursive_rule(
                  {rec_sql_depth}\n\
              )\n\
              CYCLE {cycle_cols} SET is_cycle USING cycle_path\n\
-             INSERT INTO {target} (s, o, g)\n\
-             SELECT {select_s}, {select_o}, {cte_name}.g\n\
+             INSERT INTO {target} ({head_cols})\n\
+             SELECT {select_s}, {select_o}, {cte_name}.g{head_source}\n\
              FROM {cte_name}\n\
              WHERE NOT is_cycle\n\
              ON CONFLICT DO NOTHING"
         ))
     } else {
+        // VAL-207: plain-path (mark_inferred) INSERTs carry source = 1.
+        let (head_cols, head_source) = if mark_inferred {
+            ("s, o, g, source", ", 1")
+        } else {
+            ("s, o, g", "")
+        };
+
         Ok(format!(
             "WITH RECURSIVE {cte_name}(s, o, g) AS (\n\
                  {base_sql}\n\
@@ -181,8 +196,8 @@ pub(super) fn compile_recursive_rule(
                  {rec_sql}\n\
              )\n\
              CYCLE {cycle_cols} SET is_cycle USING cycle_path\n\
-             INSERT INTO {target} (s, o, g)\n\
-             SELECT {select_s}, {select_o}, {cte_name}.g\n\
+             INSERT INTO {target} ({head_cols})\n\
+             SELECT {select_s}, {select_o}, {cte_name}.g{head_source}\n\
              FROM {cte_name}\n\
              WHERE NOT is_cycle\n\
              ON CONFLICT DO NOTHING"

@@ -17,6 +17,53 @@ use super::{
     compile_single_rule_to, has_variable_pred, parse_rules, vp_read_expr_pub,
 };
 
+/// Materialise this run's derived rows for `pred_id` from `delta_table` (an
+/// `(s, o, g)` temp table) into the predicate's canonical storage and update
+/// the catalog triple count.
+///
+/// v0.130.0 VAL-207 CANON-TARGET: promoted predicates receive the rows in
+/// their HTAP delta (`_pg_ripple.vp_{id}_delta`, source = 1); rare predicates
+/// keep `vp_rare` (source = 1).  Both inference paths — plain and semi-naive —
+/// land in the same storage, so `ON CONFLICT` deduplicates instead of
+/// materialising the same logical fact twice with distinct SIDs.
+pub(crate) fn materialise_derived_rows(pred_id: i64, delta_table: &str) -> i64 {
+    let cnt = if super::compiler::has_dedicated_vp(pred_id) {
+        Spi::get_one::<i64>(&format!(
+            "WITH ins AS ( \
+               INSERT INTO _pg_ripple.vp_{pred_id}_delta (s, o, g, source) \
+               SELECT s, o, g, 1 FROM {delta_table} \
+               ON CONFLICT DO NOTHING RETURNING 1 \
+             ) SELECT COUNT(*)::bigint FROM ins"
+        ))
+        .unwrap_or(None)
+        .unwrap_or(0)
+    } else {
+        Spi::get_one::<i64>(&format!(
+            "WITH ins AS ( \
+               INSERT INTO _pg_ripple.vp_rare (p, s, o, g, source) \
+               SELECT {pred_id}::bigint, s, o, g, 1 FROM {delta_table} \
+               ON CONFLICT DO NOTHING RETURNING 1 \
+             ) SELECT COUNT(*)::bigint FROM ins"
+        ))
+        .unwrap_or(None)
+        .unwrap_or(0)
+    };
+    if cnt > 0 {
+        Spi::run_with_args(
+            "INSERT INTO _pg_ripple.predicates (id, table_oid, triple_count) \
+             VALUES ($1, NULL, $2) \
+             ON CONFLICT (id) DO UPDATE \
+                 SET triple_count = _pg_ripple.predicates.triple_count + EXCLUDED.triple_count",
+            &[
+                pgrx::datum::DatumWithOid::from(pred_id),
+                pgrx::datum::DatumWithOid::from(cnt),
+            ],
+        )
+        .unwrap_or_else(|e| pgrx::log!("datalog cleanup: {e}"));
+    }
+    cnt
+}
+
 /// Remove eliminated rules, dropping exactly one rule instance per returned
 /// text.  `check_subsumption` reports the `rule_text` of each eliminated rule
 /// occurrence, so a genuinely duplicated rule keeps its first copy here — a
@@ -279,44 +326,30 @@ pub fn run_inference_seminaive(rule_set_name: &str) -> (i64, i32) {
         // derived rows apart from asserted ones. ON CONFLICT DO NOTHING keeps
         // an asserted (source = 0) row intact when the same triple was also
         // derivable.
-        let cnt = Spi::get_one::<i64>(&format!(
-            "WITH ins AS ( \
-               INSERT INTO _pg_ripple.vp_rare (p, s, o, g, source) \
-               SELECT {pred_id}::bigint, s, o, g, 1 FROM _dl_delta_{pred_id} \
-               ON CONFLICT DO NOTHING RETURNING 1 \
-             ) SELECT COUNT(*)::bigint FROM ins"
-        ))
-        .unwrap_or(None)
-        .unwrap_or(0);
+        // v0.130.0 VAL-207: materialisation targets the predicate's canonical
+        // storage (promoted delta instead of an unconditional vp_rare copy).
+        let cnt = materialise_derived_rows(pred_id, &format!("_dl_delta_{pred_id}"));
         total_derived += cnt;
-        if cnt > 0 {
-            Spi::run_with_args(
-                "INSERT INTO _pg_ripple.predicates (id, table_oid, triple_count) \
-                 VALUES ($1, NULL, $2) \
-                 ON CONFLICT (id) DO UPDATE \
-                     SET triple_count = _pg_ripple.predicates.triple_count + EXCLUDED.triple_count",
-                &[
-                    pgrx::datum::DatumWithOid::from(pred_id),
-                    pgrx::datum::DatumWithOid::from(cnt),
-                ],
-            )
-            .unwrap_or_else(|e| pgrx::log!("datalog cleanup: {e}"));
-        }
     }
 
     // v0.100.0 PROOF-TREE-01: record derivation provenance when record_derivations = on.
     // Delta tables are still live here (dropped further below), so we can use them
-    // to filter vp_rare to only newly-derived rows.
+    // to filter to only newly-derived rows.
     if crate::RECORD_DERIVATIONS.get() && total_derived > 0 {
-        let delta_fn = |pred_id: i64| -> Option<String> {
-            if derived_pred_ids.contains(&pred_id) {
-                Some(format!("_dl_delta_{pred_id}"))
-            } else {
-                None
-            }
+        let targets_fn = |pred_id: i64| -> Option<super::derivations::DerivationTargets> {
+            Some(super::derivations::DerivationTargets {
+                delta_table: format!("_dl_delta_{pred_id}"),
+                // v0.130.0 VAL-207: resolve SIDs where the run materialised
+                // them — the promoted delta, or vp_rare for rare predicates.
+                sid_source: super::derivations::canonical_sid_source(pred_id),
+            })
         };
         for rule in &active_rules {
-            super::derivations::record_rule_derivations_with_delta(rule, rule_set_name, &delta_fn);
+            super::derivations::record_rule_derivations_with_targets(
+                rule,
+                rule_set_name,
+                &targets_fn,
+            );
         }
     }
 
@@ -474,6 +507,16 @@ pub fn run_inference(rule_set_name: &str) -> i64 {
         let _ = super::rewrite::compute_sameas_map();
     }
 
+    // Parse all rules upfront so provenance recording can attribute each
+    // derived fact to its rule after the SQL batch executes (VAL-207).
+    let mut all_rules: Vec<Rule> = Vec::new();
+    for (rule_text, _stratum, _recursive) in &rule_rows {
+        match parse_rules(rule_text, rule_set_name) {
+            Ok(rs) => all_rules.extend(rs.rules),
+            Err(e) => pgrx::warning!("rule parse error during inference: {e}"),
+        }
+    }
+
     let mut total_derived = 0i64;
     // P13-05 (v0.85.0): batch rule SQL statements in groups of 100 before sending to SPI,
     // reducing peak memory and SPI round-trip overhead for large rule sets.
@@ -500,34 +543,59 @@ pub fn run_inference(rule_set_name: &str) -> i64 {
         batch.clear();
     };
 
-    for (rule_text, _stratum, _recursive) in rule_rows {
-        let rules = match parse_rules(&rule_text, rule_set_name) {
-            Ok(rs) => rs.rules,
-            Err(e) => {
-                pgrx::warning!("rule parse error during inference: {e}");
-                continue;
-            }
-        };
-        for rule in &rules {
-            if has_variable_pred(rule) {
-                flush_batch(&mut sql_batch, &mut total_derived);
-                total_derived += run_var_pred_rule(rule);
-            } else {
-                match compile_rule_set(std::slice::from_ref(rule)) {
-                    Ok(sqls) => {
-                        for sql in sqls {
-                            sql_batch.push(sql);
-                            if sql_batch.len() >= 100 {
-                                flush_batch(&mut sql_batch, &mut total_derived);
-                            }
+    for rule in &all_rules {
+        if has_variable_pred(rule) {
+            flush_batch(&mut sql_batch, &mut total_derived);
+            total_derived += run_var_pred_rule(rule);
+        } else {
+            match compile_rule_set(std::slice::from_ref(rule)) {
+                Ok(sqls) => {
+                    for sql in sqls {
+                        sql_batch.push(sql);
+                        if sql_batch.len() >= 100 {
+                            flush_batch(&mut sql_batch, &mut total_derived);
                         }
                     }
-                    Err(e) => pgrx::warning!("rule compile error: {e}"),
                 }
+                Err(e) => pgrx::warning!("rule compile error: {e}"),
             }
         }
     }
     flush_batch(&mut sql_batch, &mut total_derived);
+
+    // v0.130.0 PROOF-TREE-02 (VAL-207 option A): record derivation provenance
+    // from the plain path too — the production write path (`infer`) gains the
+    // same proof trees the semi-naive fixpoint already writes.
+    if crate::RECORD_DERIVATIONS.get() && total_derived > 0 {
+        let targets_fn = |pred_id: i64| -> Option<super::derivations::DerivationTargets> {
+            let delta = format!("_pg_ripple.vp_{pred_id}_delta");
+            let exists = Spi::get_one_with_args::<bool>(
+                "SELECT to_regclass($1::text) IS NOT NULL",
+                &[pgrx::datum::DatumWithOid::from(delta.clone())],
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+            if !exists {
+                return None;
+            }
+            // Filter: rows this path materialised carry source = 1
+            // (compile_single_rule marks inferred); user-asserted delta rows
+            // stay source = 0.
+            Some(super::derivations::DerivationTargets {
+                delta_table: format!("(SELECT s, o, g FROM {delta} WHERE source = 1)"),
+                sid_source: format!("(SELECT i, s, o, g FROM {delta} WHERE source = 1)"),
+            })
+        };
+        for rule in &all_rules {
+            super::derivations::record_rule_derivations_with_targets(
+                rule,
+                rule_set_name,
+                &targets_fn,
+            );
+        }
+    }
+
     // JOURNAL-DATALOG-01: flush mutation journal so CONSTRUCT writeback fires
     // after simple (non-seminaive) inference (CF-D fix).
     if total_derived > 0 {
@@ -899,24 +967,9 @@ pub(crate) fn run_seminaive_inner(rules: &[Rule], rule_set_name: &str) -> (i64, 
     for &pred_id in &derived_pred_ids {
         // v0.129.0 CONFLICT-03: materialise as inferred (source = 1); see the
         // matching comment in run_inference_seminaive.
-        let cnt = Spi::get_one::<i64>(&format!(
-            "WITH ins AS (INSERT INTO _pg_ripple.vp_rare (p, s, o, g, source) \
-             SELECT {pred_id}::bigint, s, o, g, 1 FROM _dl_delta_{pred_id} \
-             ON CONFLICT DO NOTHING RETURNING 1) SELECT COUNT(*)::bigint FROM ins"
-        ))
-        .unwrap_or(None)
-        .unwrap_or(0);
+        // v0.130.0 VAL-207: canonical storage (promoted delta when dedicated).
+        let cnt = materialise_derived_rows(pred_id, &format!("_dl_delta_{pred_id}"));
         total += cnt;
-        if cnt > 0 {
-            Spi::run_with_args(
-                "INSERT INTO _pg_ripple.predicates (id, table_oid, triple_count) VALUES ($1, NULL, $2) \
-                 ON CONFLICT (id) DO UPDATE SET triple_count = _pg_ripple.predicates.triple_count + EXCLUDED.triple_count",
-                &[
-                    pgrx::datum::DatumWithOid::from(pred_id),
-                    pgrx::datum::DatumWithOid::from(cnt),
-                ],
-            ).unwrap_or_else(|e| pgrx::log!("datalog cleanup: {e}"));
-        }
     }
 
     for &pred_id in &derived_pred_ids {

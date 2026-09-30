@@ -404,30 +404,8 @@ fn wfs_non_stratifiable(_rule_set_name: &str, all_rules: &[Rule]) -> (i64, i64, 
         let pos_tbl = format!("_wfs_pos_{pid}");
         // v0.129.0 CONFLICT-03: materialise as inferred (source = 1); see the
         // matching comment in run_inference_seminaive.
-        let cnt = Spi::get_one::<i64>(&format!(
-            "WITH ins AS ( \
-               INSERT INTO _pg_ripple.vp_rare (p, s, o, g, source) \
-               SELECT {pid}::bigint, s, o, g, 1 FROM {pos_tbl} \
-               ON CONFLICT DO NOTHING \
-               RETURNING 1 \
-             ) SELECT COUNT(*)::bigint FROM ins"
-        ))
-        .unwrap_or(None)
-        .unwrap_or(0);
-
-        if cnt > 0 {
-            Spi::run_with_args(
-                "INSERT INTO _pg_ripple.predicates (id, table_oid, triple_count) \
-                 VALUES ($1, NULL, $2) ON CONFLICT (id) DO UPDATE \
-                     SET triple_count = \
-                         _pg_ripple.predicates.triple_count + EXCLUDED.triple_count",
-                &[
-                    pgrx::datum::DatumWithOid::from(pid),
-                    pgrx::datum::DatumWithOid::from(cnt),
-                ],
-            )
-            .unwrap_or_else(|e| pgrx::log!("datalog cleanup: {e}"));
-        }
+        // v0.130.0 VAL-207: canonical storage (promoted delta when dedicated).
+        super::seminaive::materialise_derived_rows(pid, &pos_tbl);
     }
 
     // ── Cleanup temp tables ───────────────────────────────────────────────────

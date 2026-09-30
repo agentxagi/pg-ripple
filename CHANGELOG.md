@@ -7,7 +7,42 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [Unreleased]
+## [0.130.0]
+
+### Added
+
+- **Plain-path provenance (VAL-207 option A, PROOF-TREE-02).** `infer()` — the
+  production write path — records derivation provenance when
+  `pg_ripple.record_derivations = on`, so runtime-derived facts gain proof
+  trees without switching the write path to `infer_with_stats`. Recording
+  reads rule bodies through the same storages rule evaluation reads
+  (dedicated VP views ∪ `vp_rare`), so antecedents living in promoted
+  predicates (production: `depends_on` → `vp_534`) resolve to SIDs.
+
+### Changed
+
+- **Canonical materialisation for derived facts (VAL-207 CANON-TARGET).** The
+  semi-naive fixpoint, magic-sets and WFS materialisers write promoted
+  predicates into their HTAP delta (`{vp}_delta`, `source = 1`) instead of an
+  unconditional `vp_rare` copy. Plain `infer()` INSERTs into `{vp}_delta` now
+  also carry `source = 1` — one storage and one provenance class per derived
+  fact, no more double materialisation with distinct SIDs when both paths run
+  over the same rule set. `ON CONFLICT` still preserves an asserted row.
+
+### Fixed
+
+- **`justify()` could not see facts in `{vp}_delta`.** `sid_for_triple` /
+  `triple_for_sid` (3-arg `justify`) scanned `vp_rare` only; both now fall
+  back to the promoted `vp_{id}` view (main − tombstones ∪ delta), mirroring
+  the 4-arg graph-scoped lookups. The runtime conflict scan
+  (`rule_conflicts('runtime')`) and inference `explain` read the canonical
+  derived-row union (`vp_rare` + promoted deltas, `source = 1`), so conflicts
+  and inference chains stay visible for promoted heads. `explain`'s SID lookup
+  also lost a duplicated arm and an unused predicate filter — both fixed.
+  `vacuum_derivations()` no longer deletes provenance whose fact lives in a
+  promoted delta/main (vp_rare-only existence check).
+
+## [0.129.0]
 
 ### Added
 
