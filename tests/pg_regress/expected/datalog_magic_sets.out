@@ -36,6 +36,9 @@ SELECT pg_ripple.load_rules_builtin('rdfs') > 0 AS rdfs_loaded;
 SELECT jsonb_typeof(pg_ripple.infer_goal('rdfs', '?x ?p ?y')) = 'object'
     AS result_is_object;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  result_is_object 
 ------------------
  t
@@ -44,6 +47,9 @@ WARNING:  semi-naive rule compile error: variable predicate in rule body not sup
 -- 3. JSONB result contains required keys.
 SELECT pg_ripple.infer_goal('rdfs', '?x ?p ?y') ? 'derived'    AS has_derived;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  has_derived 
 -------------
  t
@@ -51,12 +57,18 @@ WARNING:  semi-naive rule compile error: variable predicate in rule body not sup
 
 SELECT pg_ripple.infer_goal('rdfs', '?x ?p ?y') ? 'iterations' AS has_iterations;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  has_iterations 
 ----------------
  t
 (1 row)
 
 SELECT pg_ripple.infer_goal('rdfs', '?x ?p ?y') ? 'matching'   AS has_matching;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  has_matching 
 --------------
@@ -66,6 +78,9 @@ WARNING:  semi-naive rule compile error: variable predicate in rule body not sup
 -- 4. matching count is non-negative.
 SELECT (pg_ripple.infer_goal('rdfs', '?x ?p ?y')->>'matching')::bigint >= 0
     AS matching_nonneg;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  matching_nonneg 
 -----------------
@@ -82,6 +97,9 @@ SHOW pg_ripple.magic_sets;
 
 SELECT jsonb_typeof(pg_ripple.infer_goal('rdfs', '?x ?p ?y')) = 'object'
     AS fallback_result_is_object;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  fallback_result_is_object 
 ---------------------------

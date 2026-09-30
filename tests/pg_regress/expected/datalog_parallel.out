@@ -107,6 +107,9 @@ SELECT pg_ripple.load_rules_builtin('rdfs') > 0 AS rdfs_loaded_w1;
 
 SELECT (pg_ripple.infer_with_stats('rdfs')->>'derived')::bigint >= 0 AS derived_w1_nonneg;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  derived_w1_nonneg 
 -------------------
  t
@@ -135,6 +138,9 @@ SELECT pg_ripple.load_rules_builtin('rdfs') > 0 AS rdfs_loaded_w4;
 (1 row)
 
 SELECT (pg_ripple.infer_with_stats('rdfs')->>'derived')::bigint >= 0 AS derived_w4_nonneg;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  derived_w4_nonneg 
 -------------------
@@ -176,6 +182,26 @@ SELECT (pg_ripple.infer_with_stats('owl-rl')->>'parallel_groups')::int >= 0
     AS has_parallel_groups;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in recursive rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in recursive rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
 WARNING:  semi-naive compile error: variable predicate in body not supported
  has_parallel_groups 
 ---------------------
@@ -187,6 +213,22 @@ SELECT (pg_ripple.infer_with_stats('owl-rl')->>'max_concurrent')::int >= 0
     AS has_max_concurrent;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in recursive rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in recursive rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
 WARNING:  semi-naive compile error: variable predicate in body not supported
  has_max_concurrent 
 --------------------
@@ -198,6 +240,22 @@ SELECT (pg_ripple.infer_with_stats('owl-rl')->>'parallel_groups')::int > 1
     AS owl_rl_has_multiple_groups;
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in recursive rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in recursive rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
+WARNING:  semi-naive compile error: variable predicate in body not supported
 WARNING:  semi-naive compile error: variable predicate in body not supported
  owl_rl_has_multiple_groups 
 ----------------------------
@@ -231,6 +289,9 @@ SET pg_ripple.datalog_parallel_threshold = 0;
 -- and completes without PT3001; parallel_groups >= 1 confirms it ran.
 SELECT (pg_ripple.infer_with_stats('rdfs')->>'parallel_groups')::int >= 1
     AS cyclic_precheck_no_crash;
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
+WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
 WARNING:  semi-naive rule compile error: variable predicate in rule body not supported
  cyclic_precheck_no_crash 
 --------------------------

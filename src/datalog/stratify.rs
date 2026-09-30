@@ -551,94 +551,208 @@ pub fn stratify(rules: &[Rule]) -> Result<StratifiedProgram, String> {
 }
 
 // ─── v0.29.0: Subsumption checking ───────────────────────────────────────────
+// ─── v0.129.0: constants-aware (full atoms, not just predicate IDs) ─────────
+
+/// Canonical term: variables renamed to first-occurrence indices, constants
+/// and special terms kept verbatim.  Two terms with equal canonical forms are
+/// equal up to consistent variable renaming.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum CTerm {
+    Var(usize),
+    Const(i64),
+    Wildcard,
+    DefaultGraph,
+}
+
+/// Canonical atom: `[s, p, o, g]` in canonical terms.
+type CAtom = [CTerm; 4];
+
+fn canon_term(term: &Term, vars: &mut HashMap<String, usize>) -> CTerm {
+    match term {
+        Term::Var(name) => {
+            let next = vars.len();
+            CTerm::Var(*vars.entry(name.clone()).or_insert(next))
+        }
+        Term::Const(id) => CTerm::Const(*id),
+        Term::Wildcard => CTerm::Wildcard,
+        Term::DefaultGraph => CTerm::DefaultGraph,
+    }
+}
+
+fn canon_atom(atom: &Atom, vars: &mut HashMap<String, usize>) -> CAtom {
+    [
+        canon_term(&atom.s, vars),
+        canon_term(&atom.p, vars),
+        canon_term(&atom.o, vars),
+        canon_term(&atom.g, vars),
+    ]
+}
+
+/// Canonical view of a rule for subsumption checking.
+///
+/// Only rules with a constant head predicate and an all-positive body are
+/// eligible for elimination; anything else (constraint rules, negation,
+/// guards, aggregates, temporal filters) is kept verbatim — sound elimination
+/// there needs the full literal structure compared, which subsumption
+/// matching does not model.  Weighted (probabilistic) rules are likewise kept:
+/// removing one changes the proof multiplicity even when the atoms match.
+#[derive(PartialEq, Debug)]
+struct CanonRule {
+    head: CAtom,
+    /// Canonical positive body atoms, sorted (order-insensitive multiset).
+    body: Vec<CAtom>,
+    weight: Option<f64>,
+}
+
+impl CanonRule {
+    fn new(rule: &Rule) -> Option<Self> {
+        let head = rule.head.as_ref()?;
+        if !matches!(head.p, Term::Const(_)) {
+            return None;
+        }
+        let mut vars = HashMap::new();
+        let head = canon_atom(head, &mut vars);
+        let mut body: Vec<CAtom> = Vec::with_capacity(rule.body.len());
+        for lit in &rule.body {
+            match lit {
+                BodyLiteral::Positive(atom) => body.push(canon_atom(atom, &mut vars)),
+                _ => return None,
+            }
+        }
+        body.sort();
+        Some(Self {
+            head,
+            body,
+            weight: rule.weight,
+        })
+    }
+
+    /// `self` (R1) subsumes `other` (R2) when some substitution σ, consistent
+    /// across head and body, maps R1's head onto R2's head and R1's body into
+    /// a strict sub-multiset of R2's body (constants compared exactly).  Every
+    /// fact derived by R2 is then also derived by R1, so R2 can be removed
+    /// without changing the minimal model.
+    fn subsumes(&self, other: &CanonRule) -> bool {
+        if self.weight.is_some() || other.weight.is_some() {
+            return false;
+        }
+        if self.body.len() >= other.body.len() {
+            return false;
+        }
+        let mut subst: HashMap<usize, CTerm> = HashMap::new();
+        match_atom(&self.head, &other.head, &mut subst)
+            && match_submultiset(&self.body, &other.body, &mut subst)
+    }
+}
+
+/// Match pattern term `p` against target term `t`, binding free pattern
+/// variables in `subst`.  Pattern wildcards match anything; constants must be
+/// equal.
+fn match_term(p: &CTerm, t: &CTerm, subst: &mut HashMap<usize, CTerm>) -> bool {
+    match p {
+        CTerm::Var(i) => match subst.get(i) {
+            Some(bound) => bound == t,
+            None => {
+                subst.insert(*i, *t);
+                true
+            }
+        },
+        CTerm::Const(c) => matches!(t, CTerm::Const(d) if d == c),
+        CTerm::Wildcard => true,
+        CTerm::DefaultGraph => t == &CTerm::DefaultGraph,
+    }
+}
+
+/// Match a whole atom; on failure, roll back any bindings made.
+fn match_atom(p: &CAtom, t: &CAtom, subst: &mut HashMap<usize, CTerm>) -> bool {
+    let saved = subst.clone();
+    if p.iter().zip(t.iter()).all(|(pt, tt)| match_term(pt, tt, subst)) {
+        true
+    } else {
+        *subst = saved;
+        false
+    }
+}
+
+/// Backtracking search for an injective mapping of every pattern atom onto a
+/// distinct target atom under one consistent substitution.
+fn match_submultiset(pat: &[CAtom], tgt: &[CAtom], subst: &mut HashMap<usize, CTerm>) -> bool {
+    fn go(
+        pat: &[CAtom],
+        idx: usize,
+        tgt: &[CAtom],
+        used: &mut [bool],
+        subst: &mut HashMap<usize, CTerm>,
+    ) -> bool {
+        if idx == pat.len() {
+            return true;
+        }
+        for (ti, t) in tgt.iter().enumerate() {
+            if used[ti] {
+                continue;
+            }
+            let saved = subst.clone();
+            if match_atom(&pat[idx], t, subst) {
+                used[ti] = true;
+                if go(pat, idx + 1, tgt, used, subst) {
+                    return true;
+                }
+                used[ti] = false;
+            }
+            *subst = saved;
+        }
+        false
+    }
+
+    let mut used = vec![false; tgt.len()];
+    go(pat, 0, tgt, &mut used, subst)
+}
 
 /// Check each pair of rules in a stratified program for subsumption.
 ///
-/// Rule R2 is subsumed by rule R1 when:
-/// - Both rules have the same head predicate.
-/// - R1's positive body atoms are a (non-strict) subset of R2's positive body atoms
-///   (up to variable renaming within each rule).
-/// - R2 therefore always derives the same facts as R1, plus possibly more —
-///   so R1 is strictly more general and R2 can be eliminated without changing
-///   the minimal model.
+/// Rule R2 is eliminated when either:
+///
+/// - **Subsumed** — some rule R1 with a strictly smaller positive body maps
+///   onto R2 under a consistent substitution: R1's full head atom equals R2's
+///   and R1's body is a sub-multiset of R2's, with constants compared exactly
+///   (v0.129.0 — the previous check compared predicate-ID multisets only and
+///   eliminated rules that differed in constants, silently dropping one side
+///   of a head conflict before fixpoint).  R2 then derives a subset of R1's
+///   facts and can be removed without changing the minimal model.
+/// - **Duplicate** — R2 is identical to an earlier R1 up to variable renaming
+///   and weight (full atoms compared, not just predicates).
 ///
 /// Returns the list of `rule_text` values of eliminated (subsumed) rules.
+/// Callers must remove at most one rule instance per returned text — see
+/// `filter_subsumed` in `seminaive`.
 ///
 /// This function is a compile-time optimization: subsumed rules are removed
 /// before fixpoint evaluation, reducing the number of SQL statements generated
 /// per iteration.  Controlled by (always-on for now; future GUC planned).
 pub fn check_subsumption(rules: &[Rule]) -> Vec<String> {
+    let canon: Vec<Option<CanonRule>> = rules.iter().map(CanonRule::new).collect();
     let mut eliminated: Vec<String> = Vec::new();
-    let n = rules.len();
 
-    'outer: for j in 0..n {
-        let r2 = &rules[j];
-        let Some(r2_head) = &r2.head else { continue };
-        let Term::Const(r2_head_pred) = &r2_head.p else {
+    'outer: for j in 0..rules.len() {
+        let Some(c2) = &canon[j] else {
             continue;
         };
-
-        // Collect r2's positive body predicate IDs (multiset).
-        let r2_body_preds: Vec<i64> = r2
-            .body
-            .iter()
-            .filter_map(|lit| {
-                if let BodyLiteral::Positive(a) = lit
-                    && let Term::Const(id) = &a.p
-                {
-                    return Some(*id);
-                }
-                None
-            })
-            .collect();
-
-        // Check if any other rule R1 (i ≠ j) subsumes R2.
-        for (i, r1) in rules.iter().enumerate() {
+        for (i, c1) in canon.iter().enumerate() {
             if i == j {
                 continue;
             }
-            let Some(r1_head) = &r1.head else { continue };
-            let Term::Const(r1_head_pred) = &r1_head.p else {
+            let Some(c1) = c1 else {
                 continue;
             };
-
-            // Same head predicate required.
-            if r1_head_pred != r2_head_pred {
-                continue;
-            }
-
-            // Collect r1's positive body predicate IDs.
-            let r1_body_preds: Vec<i64> = r1
-                .body
-                .iter()
-                .filter_map(|lit| {
-                    if let BodyLiteral::Positive(a) = lit
-                        && let Term::Const(id) = &a.p
-                    {
-                        return Some(*id);
-                    }
-                    None
-                })
-                .collect();
-
-            // R2 is subsumed by R1 when:
-            // 1. R1's body pred multiset ⊆ R2's body pred multiset (R1 is more general).
-            // 2. R1 has strictly fewer body atoms (so R2 is the redundant one).
-            // 3. Neither rule is a constraint rule (handled separately).
-            if r1_body_preds.len() < r2_body_preds.len()
-                && is_multiset_subset(&r1_body_preds, &r2_body_preds)
-            {
-                eliminated.push(r2.rule_text.clone());
+            // Genuine subsumption: R1 is strictly more general than R2.
+            if c1.subsumes(c2) {
+                eliminated.push(rules[j].rule_text.clone());
                 continue 'outer;
             }
-
-            // Identical rules (same head, same body multiset) — keep only one.
-            if i < j
-                && r1_body_preds.len() == r2_body_preds.len()
-                && is_multiset_subset(&r1_body_preds, &r2_body_preds)
-                && is_multiset_subset(&r2_body_preds, &r1_body_preds)
-            {
-                eliminated.push(r2.rule_text.clone());
+            // Exact duplicates (same head, body, and weight up to variable
+            // renaming): keep only the first occurrence.
+            if i < j && c1 == c2 {
+                eliminated.push(rules[j].rule_text.clone());
                 continue 'outer;
             }
         }
@@ -739,23 +853,6 @@ fn can_reach_positive(start: i64, target: i64, deps: &HashMap<i64, Vec<i64>>) ->
     false
 }
 
-/// Test whether `a` is a multiset subset of `b`
-/// (every element in `a` appears at least as many times in `b`).
-fn is_multiset_subset(a: &[i64], b: &[i64]) -> bool {
-    let mut counts: HashMap<i64, usize> = HashMap::new();
-    for &x in b {
-        *counts.entry(x).or_insert(0) += 1;
-    }
-    for &x in a {
-        let count = counts.entry(x).or_insert(0);
-        if *count == 0 {
-            return false;
-        }
-        *count -= 1;
-    }
-    true
-}
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -822,5 +919,228 @@ mod tests {
         let result = stratify(&rules).unwrap();
         let has_recursive = result.strata.iter().any(|s| s.is_recursive);
         assert!(has_recursive);
+    }
+
+    // ─── check_subsumption (constants-aware, v0.129.0) ──────────────────────
+
+    use crate::datalog::Term::{Const, Var};
+
+    /// Head atom `?s <head_p> ?o` in the default graph.
+    fn head_atom(p: i64, s: Term, o: Term) -> Atom {
+        Atom {
+            s,
+            p: Term::Const(p),
+            o,
+            g: Term::DefaultGraph,
+        }
+    }
+
+    /// Positive body atom `?s <p> ?o` in the default graph.
+    fn pos_atom(s: Term, p: i64, o: Term) -> BodyLiteral {
+        BodyLiteral::Positive(Atom {
+            s,
+            p: Term::Const(p),
+            o,
+            g: Term::DefaultGraph,
+        })
+    }
+
+    fn lit_rule(head: Atom, body: Vec<BodyLiteral>, text: &str, weight: Option<f64>) -> Rule {
+        Rule {
+            head: Some(head),
+            body,
+            rule_text: text.to_owned(),
+            weight,
+        }
+    }
+
+    #[test]
+    fn test_subsumption_keeps_rules_differing_only_in_body_constants() {
+        // Same head, same body predicate, different constants — neither rule
+        // may be eliminated.  v0.128.0 deduplicated them, silently dropping
+        // one side of a head conflict before rule_conflicts could see it.
+        let rules = vec![
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+                vec![pos_atom(Var("x".to_owned()), 20, Const(300))],
+                "r1",
+                None,
+            ),
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+                vec![pos_atom(Var("x".to_owned()), 20, Const(301))],
+                "r2",
+                None,
+            ),
+        ];
+        assert!(check_subsumption(&rules).is_empty());
+    }
+
+    #[test]
+    fn test_subsumption_keeps_rules_differing_only_in_head_constants() {
+        let rules = vec![
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Const(100)),
+                vec![pos_atom(Var("x".to_owned()), 20, Var("y".to_owned()))],
+                "r1",
+                None,
+            ),
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Const(101)),
+                vec![pos_atom(Var("x".to_owned()), 20, Var("y".to_owned()))],
+                "r2",
+                None,
+            ),
+        ];
+        assert!(check_subsumption(&rules).is_empty());
+    }
+
+    #[test]
+    fn test_subsumption_dedupes_rules_identical_up_to_renaming() {
+        let rules = vec![
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+                vec![pos_atom(Var("x".to_owned()), 20, Var("y".to_owned()))],
+                "r1",
+                None,
+            ),
+            lit_rule(
+                head_atom(10, Var("a".to_owned()), Var("b".to_owned())),
+                vec![pos_atom(Var("a".to_owned()), 20, Var("b".to_owned()))],
+                "r2",
+                None,
+            ),
+        ];
+        assert_eq!(check_subsumption(&rules), vec!["r2".to_owned()]);
+    }
+
+    #[test]
+    fn test_subsumption_detects_genuine_subset() {
+        // R1: p(?x,?y) :- q(?x,?y).  R2: same with an extra body atom.
+        let rules = vec![
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+                vec![pos_atom(Var("x".to_owned()), 20, Var("y".to_owned()))],
+                "r1",
+                None,
+            ),
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+                vec![
+                    pos_atom(Var("x".to_owned()), 20, Var("y".to_owned())),
+                    pos_atom(Var("x".to_owned()), 30, Var("y".to_owned())),
+                ],
+                "r2",
+                None,
+            ),
+        ];
+        assert_eq!(check_subsumption(&rules), vec!["r2".to_owned()]);
+    }
+
+    #[test]
+    fn test_subsumption_binds_constants_through_substitution() {
+        // R1 derives p(?x,?y) for every q pair; R2 derives the single p(a,b),
+        // so R1 subsumes R2 via σ(?x)=a, σ(?y)=b.
+        let rules = vec![
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+                vec![pos_atom(Var("x".to_owned()), 20, Var("y".to_owned()))],
+                "r1",
+                None,
+            ),
+            lit_rule(
+                head_atom(10, Const(100), Const(200)),
+                vec![
+                    pos_atom(Const(100), 20, Const(200)),
+                    pos_atom(Const(100), 30, Var("z".to_owned())),
+                ],
+                "r2",
+                None,
+            ),
+        ];
+        assert_eq!(check_subsumption(&rules), vec!["r2".to_owned()]);
+    }
+
+    #[test]
+    fn test_subsumption_respects_variable_joins() {
+        // R1 requires the two q arguments to unify (?x ?x); R2's q(?x,?y)
+        // admits distinct values, so R1 does not subsume R2.
+        let rules = vec![
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+                vec![pos_atom(Var("x".to_owned()), 20, Var("x".to_owned()))],
+                "r1",
+                None,
+            ),
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+                vec![
+                    pos_atom(Var("x".to_owned()), 20, Var("y".to_owned())),
+                    pos_atom(Var("x".to_owned()), 30, Var("y".to_owned())),
+                ],
+                "r2",
+                None,
+            ),
+        ];
+        assert!(check_subsumption(&rules).is_empty());
+    }
+
+    #[test]
+    fn test_subsumption_skips_negated_bodies() {
+        // R2's negation makes it strictly weaker than R1 — not a duplicate.
+        let rules = vec![
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+                vec![pos_atom(Var("x".to_owned()), 20, Var("y".to_owned()))],
+                "r1",
+                None,
+            ),
+            Rule {
+                head: Some(head_atom(10, Var("x".to_owned()), Var("y".to_owned()))),
+                body: vec![
+                    pos_atom(Var("x".to_owned()), 20, Var("y".to_owned())),
+                    BodyLiteral::Negated(Atom {
+                        s: Var("x".to_owned()),
+                        p: Term::Const(30),
+                        o: Var("y".to_owned()),
+                        g: Term::DefaultGraph,
+                    }),
+                ],
+                rule_text: "r2".to_owned(),
+                weight: None,
+            },
+        ];
+        assert!(check_subsumption(&rules).is_empty());
+    }
+
+    #[test]
+    fn test_subsumption_weighted_rules() {
+        let mk = |text: &str, weight: Option<f64>| {
+            lit_rule(
+                head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+                vec![pos_atom(Var("x".to_owned()), 20, Var("y".to_owned()))],
+                text,
+                weight,
+            )
+        };
+        // Identical form, different weights: kept (probabilities differ).
+        assert!(check_subsumption(&[mk("r1", None), mk("r2", Some(0.5))]).is_empty());
+        // Identical form, same weight: deduplicated.
+        assert_eq!(
+            check_subsumption(&[mk("r1", Some(0.5)), mk("r2", Some(0.5))]),
+            vec!["r2".to_owned()]
+        );
+        // Weighted rule is never subsumption-eliminated.
+        let general = mk("r1", Some(0.5));
+        let specific = lit_rule(
+            head_atom(10, Var("x".to_owned()), Var("y".to_owned())),
+            vec![
+                pos_atom(Var("x".to_owned()), 20, Var("y".to_owned())),
+                pos_atom(Var("x".to_owned()), 30, Var("y".to_owned())),
+            ],
+            "r2",
+            None,
+        );
+        assert_eq!(check_subsumption(&[general, specific]), Vec::<String>::new());
     }
 }
