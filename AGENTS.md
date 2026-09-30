@@ -101,8 +101,24 @@ All user-visible objects live in the `pg_ripple` schema; internal tables and VP 
 
 ## Build & Test
 
+> **Production host warning (agentxagi fork).** On the Valor Digital host the
+> system `pg_config` (`/usr/bin/pg_config`, `/usr/lib/postgresql/18/bin/pg_config`)
+> belongs to the **production** cluster (port 5433). `cargo pgrx install`, `test`
+> and `regress` install the extension into the libdir of the `pg_config` they
+> target, and without `--release` that is a debug build. This overwrote the
+> production `.so` twice (2026-09-29 16:13 and 2026-09-30 00:30), and the next
+> PostgreSQL restart loaded the debug build in production.
+>
+> - Tests: keep `pg18` in `~/.pgrx/config.toml` pointing at the isolated pgrx
+>   install (`/var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config`).
+>   Never run `cargo pgrx init --pg18 /usr/bin/pg_config` on that host.
+> - Shipping to production: `cargo pgrx package --pg-config /usr/lib/postgresql/18/bin/pg_config`
+>   (release by default; writes only under the target dir). Copy the `.so` and the
+>   `extension/` files in a maintenance window, restart PostgreSQL, then confirm the
+>   postmaster log says `merge worker 0 starting (release build`.
+
 ```bash
-# Install and test against PG18
+# Install and test against PG18 (a pgrx-managed or otherwise NON-production PG18)
 cargo pgrx init --pg18 $(which pg18)
 cargo pgrx test pg18
 
@@ -115,8 +131,9 @@ bash tests/test_migration_chain.sh
 # Or via justfile:
 just test-migration
 
-# Install into a local PG18 instance
-cargo pgrx install --pg-config $(which pg_config)
+# Install into a local, NON-production PG18 instance (never the system pg_config
+# on a host that runs a production cluster — see the warning above)
+cargo pgrx install --release --pg-config /path/to/non-production/pg_config
 ```
 
 ## Key Design Constraints
