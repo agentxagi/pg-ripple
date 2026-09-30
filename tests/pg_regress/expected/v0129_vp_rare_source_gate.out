@@ -10,7 +10,7 @@
 --   SRC-GATE-4: dedicated-VP predicates (e.g. depends_on in production) are
 --               covered — derived rows land in vp_rare with source = 1
 --   SRC-GATE-5: plain infer() alone keeps PT0451 inert (it records no
---               derivations; depends on VAL-187 option (A) — see ADR-058)
+--               derivations; depends on VAL-187 option (A) — see ADR-059)
 --   SRC-GATE-6: plain infer() gate fires once provenance exists (parity proof)
 --   SRC-GATE-7: remove_rule() retracts derived facts (DELETE ... source = 1)
 --
@@ -258,7 +258,7 @@ SET pg_ripple.block_on_conflict = off;
 --
 -- The plain path materialises into the dedicated VP delta tables and records
 -- nothing in _pg_ripple.derivations, so the runtime scan has no provenance to
--- join.  This is EXPECTED and documented in ADR-058: reactivating the gate on
+-- join.  This is EXPECTED and documented in ADR-059: reactivating the gate on
 -- the production write path depends on VAL-187 option (A), pending decision.
 -- ══════════════════════════════════════════════════════════════════════════════
 SELECT pg_ripple.drop_rules('sg_plain') >= 0 AS sg_plain_rules_dropped;
