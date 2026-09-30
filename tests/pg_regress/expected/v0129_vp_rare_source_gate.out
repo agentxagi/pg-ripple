@@ -1,0 +1,459 @@
+-- v0.129.0 Regression Tests
+-- Tests for: CONFLICT-03 — Datalog materialisation writes vp_rare.source = 1
+--            and the conflict gate (PT0451) is paritated between infer() and
+--            infer_with_stats().
+--
+-- Covers:
+--   SRC-GATE-1: infer_with_stats() materialises derived triples with source = 1
+--   SRC-GATE-2: rule_conflicts(rs, 'runtime') detects the contradiction
+--   SRC-GATE-3: block_on_conflict = on raises PT0451 in infer_with_stats()
+--   SRC-GATE-4: dedicated-VP predicates (e.g. depends_on in production) are
+--               covered — derived rows land in vp_rare with source = 1
+--   SRC-GATE-5: plain infer() alone keeps PT0451 inert (it records no
+--               derivations; depends on VAL-187 option (A) — see ADR-058)
+--   SRC-GATE-6: plain infer() gate fires once provenance exists (parity proof)
+--   SRC-GATE-7: remove_rule() retracts derived facts (DELETE ... source = 1)
+--
+-- NOTE: the conflicting rules below use distinct body predicates on purpose.
+-- check_subsumption() compares body-predicate multisets only and eliminates a
+-- later rule whose body-predicate multiset equals an earlier rule's — even when
+-- the constant arguments differ (upstream defect, tracked separately).  Rules
+-- sharing the body predicate would silently lose one side of the conflict.
+--
+-- Namespace: https://val197.test/
+-- The "loaded without shared_preload_libraries" WARNING is emitted either at
+-- CREATE EXTENSION or at LOAD depending on whether the library was already
+-- loaded in this session — suppress it so the expected output is order-stable.
+SET client_min_messages = error;
+CREATE EXTENSION IF NOT EXISTS pg_ripple;
+SET search_path TO pg_ripple, public;
+-- Load library so _PG_init registers GUCs (required when shared_preload_libraries is not set).
+LOAD '$libdir/pg_ripple';
+SET client_min_messages = DEFAULT;
+-- Provenance recording is required for the runtime conflict scan.
+SET pg_ripple.record_derivations = on;
+-- Helper: run a statement, swallow errors, return SQLERRM (or 'no_error').
+CREATE FUNCTION pg_temp.catch_error(stmt TEXT) RETURNS TEXT AS $$
+DECLARE
+    err TEXT;
+BEGIN
+    BEGIN
+        EXECUTE stmt;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN SQLERRM;
+    END;
+    RETURN 'no_error';
+END;
+$$ LANGUAGE plpgsql;
+-- ══════════════════════════════════════════════════════════════════════════════
+-- SRC-GATE-1 / SRC-GATE-2: semi-naive materialises source = 1 and runtime
+-- detection finds the contradiction.
+-- ══════════════════════════════════════════════════════════════════════════════
+SELECT pg_ripple.drop_rules('sg_flag') >= 0 AS sg_flag_rules_dropped;
+ sg_flag_rules_dropped 
+-----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val197.test/flag> "yes" :- ?x <https://val197.test/trigger_a> "A" .
+     ?x <https://val197.test/flag> "no"  :- ?x <https://val197.test/trigger_b> "B" .',
+    'sg_flag'
+) = 2 AS sg_flag_rules_loaded;
+ sg_flag_rules_loaded 
+----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Alice>',
+    '<https://val197.test/trigger_a>',
+    '"A"'
+) >= 1 AS sg_flag_trigger_a_inserted;
+ sg_flag_trigger_a_inserted 
+----------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Alice>',
+    '<https://val197.test/trigger_b>',
+    '"B"'
+) >= 1 AS sg_flag_trigger_b_inserted;
+ sg_flag_trigger_b_inserted 
+----------------------------
+ t
+(1 row)
+
+SELECT (pg_ripple.infer_with_stats('sg_flag') ->> 'derived')::bigint >= 2
+    AS sg_flag_stats_derived_conflicting_pair;
+ sg_flag_stats_derived_conflicting_pair 
+----------------------------------------
+ t
+(1 row)
+
+-- THE FIX: derived triples must carry source = 1 (pre-fix: 0).
+SELECT count(*) = 2 AS sg_flag_derived_rows_have_source_1
+FROM _pg_ripple.vp_rare
+WHERE p = (SELECT id FROM _pg_ripple.dictionary
+           WHERE value = 'https://val197.test/flag')
+  AND source = 1;
+ sg_flag_derived_rows_have_source_1 
+------------------------------------
+ t
+(1 row)
+
+-- THE PAYOFF: the runtime scan joins derivations with vp_rare ... source = 1
+-- and must now find the contradiction (pre-fix: always []).
+SELECT jsonb_array_length(pg_ripple.rule_conflicts('sg_flag', 'runtime')) > 0
+    AS sg_flag_runtime_scan_detects_conflict;
+ sg_flag_runtime_scan_detects_conflict 
+---------------------------------------
+ t
+(1 row)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- SRC-GATE-4: predicate with a dedicated VP table (production shape of
+-- depends_on / vp_534).  Asserted rows get promoted; rule-derived rows still
+-- materialise in vp_rare — now with source = 1, so the runtime scan sees them.
+-- ══════════════════════════════════════════════════════════════════════════════
+SET pg_ripple.vp_promotion_threshold = 100;
+-- 100 asserted triples push the predicate over the promotion threshold.
+DO $$
+DECLARE
+    i INT;
+BEGIN
+    FOR i IN 1..100 LOOP
+        PERFORM pg_ripple.insert_triple(
+            '<https://val197.test/Svc' || i || '>',
+            '<https://val197.test/depends_on>',
+            '<https://val197.test/SvcA>'
+        );
+    END LOOP;
+END;
+$$;
+SELECT table_oid IS NOT NULL AS sg_dep_predicate_has_dedicated_vp_table
+FROM _pg_ripple.predicates
+WHERE id = (SELECT id FROM _pg_ripple.dictionary
+            WHERE value = 'https://val197.test/depends_on');
+ sg_dep_predicate_has_dedicated_vp_table 
+-----------------------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.drop_rules('sg_dep') >= 0 AS sg_dep_rules_dropped;
+ sg_dep_rules_dropped 
+----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val197.test/depends_on> <https://val197.test/SvcA> :- ?x <https://val197.test/needs_a> "a" .
+     ?x <https://val197.test/depends_on> <https://val197.test/SvcB> :- ?x <https://val197.test/needs_b> "b" .',
+    'sg_dep'
+) = 2 AS sg_dep_rules_loaded;
+ sg_dep_rules_loaded 
+---------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Node1>',
+    '<https://val197.test/needs_a>',
+    '"a"'
+) >= 1 AS sg_dep_needs_a_inserted;
+ sg_dep_needs_a_inserted 
+-------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Node1>',
+    '<https://val197.test/needs_b>',
+    '"b"'
+) >= 1 AS sg_dep_needs_b_inserted;
+ sg_dep_needs_b_inserted 
+-------------------------
+ t
+(1 row)
+
+SELECT (pg_ripple.infer_with_stats('sg_dep') ->> 'derived')::bigint >= 2
+    AS sg_dep_stats_derived_conflicting_pair;
+ sg_dep_stats_derived_conflicting_pair 
+---------------------------------------
+ t
+(1 row)
+
+-- Derived rows for the dedicated-VP predicate live in vp_rare with source = 1.
+SELECT count(*) = 2 AS sg_dep_derived_rows_have_source_1
+FROM _pg_ripple.vp_rare
+WHERE p = (SELECT id FROM _pg_ripple.dictionary
+           WHERE value = 'https://val197.test/depends_on')
+  AND source = 1;
+ sg_dep_derived_rows_have_source_1 
+-----------------------------------
+ t
+(1 row)
+
+SELECT jsonb_array_length(pg_ripple.rule_conflicts('sg_dep', 'runtime')) > 0
+    AS sg_dep_runtime_scan_detects_conflict;
+ sg_dep_runtime_scan_detects_conflict 
+--------------------------------------
+ t
+(1 row)
+
+RESET pg_ripple.vp_promotion_threshold;
+-- ══════════════════════════════════════════════════════════════════════════════
+-- SRC-GATE-3: block_on_conflict = on raises PT0451 in infer_with_stats()
+-- (gate parity — pre-fix only infer() had the post-check).
+-- ══════════════════════════════════════════════════════════════════════════════
+SELECT pg_ripple.drop_rules('sg_block') >= 0 AS sg_block_rules_dropped;
+ sg_block_rules_dropped 
+------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val197.test/status> "active"   :- ?x <https://val197.test/cond_a> "a" .
+     ?x <https://val197.test/status> "inactive" :- ?x <https://val197.test/cond_b> "b" .',
+    'sg_block'
+) = 2 AS sg_block_rules_loaded;
+ sg_block_rules_loaded 
+-----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Node2>',
+    '<https://val197.test/cond_a>',
+    '"a"'
+) >= 1 AS sg_block_cond_a_inserted;
+ sg_block_cond_a_inserted 
+--------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Node2>',
+    '<https://val197.test/cond_b>',
+    '"b"'
+) >= 1 AS sg_block_cond_b_inserted;
+ sg_block_cond_b_inserted 
+--------------------------
+ t
+(1 row)
+
+SET pg_ripple.block_on_conflict = on;
+SELECT pg_temp.catch_error(
+    'SELECT pg_ripple.infer_with_stats(''sg_block'')'
+) LIKE '%PT0451%' AS sg_block_stats_gate_raises_pt0451;
+ sg_block_stats_gate_raises_pt0451 
+-----------------------------------
+ t
+(1 row)
+
+SET pg_ripple.block_on_conflict = off;
+-- ══════════════════════════════════════════════════════════════════════════════
+-- SRC-GATE-5: plain infer() alone keeps PT0451 inert.
+--
+-- The plain path materialises into the dedicated VP delta tables and records
+-- nothing in _pg_ripple.derivations, so the runtime scan has no provenance to
+-- join.  This is EXPECTED and documented in ADR-058: reactivating the gate on
+-- the production write path depends on VAL-187 option (A), pending decision.
+-- ══════════════════════════════════════════════════════════════════════════════
+SELECT pg_ripple.drop_rules('sg_plain') >= 0 AS sg_plain_rules_dropped;
+ sg_plain_rules_dropped 
+------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val197.test/state> "on"  :- ?x <https://val197.test/input_a> "a" .
+     ?x <https://val197.test/state> "off" :- ?x <https://val197.test/input_b> "b" .',
+    'sg_plain'
+) = 2 AS sg_plain_rules_loaded;
+ sg_plain_rules_loaded 
+-----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Node3>',
+    '<https://val197.test/input_a>',
+    '"a"'
+) >= 1 AS sg_plain_input_a_inserted;
+ sg_plain_input_a_inserted 
+---------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Node3>',
+    '<https://val197.test/input_b>',
+    '"b"'
+) >= 1 AS sg_plain_input_b_inserted;
+ sg_plain_input_b_inserted 
+---------------------------
+ t
+(1 row)
+
+SET pg_ripple.block_on_conflict = on;
+-- No PT0451: the plain path records no derivations for the scan to join.
+SELECT pg_temp.catch_error('SELECT pg_ripple.infer(''sg_plain'')') = 'no_error'
+    AS sg_plain_infer_gate_inert_without_provenance;
+ sg_plain_infer_gate_inert_without_provenance 
+----------------------------------------------
+ t
+(1 row)
+
+-- And the scan stays empty on its own.
+SELECT jsonb_array_length(pg_ripple.rule_conflicts('sg_plain', 'runtime')) = 0
+    AS sg_plain_runtime_scan_empty_without_provenance;
+ sg_plain_runtime_scan_empty_without_provenance 
+------------------------------------------------
+ t
+(1 row)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- SRC-GATE-6: once provenance exists (semi-naive run below), the plain gate
+-- fires — proving the infer() post-check itself is correct.
+-- ══════════════════════════════════════════════════════════════════════════════
+SET pg_ripple.block_on_conflict = off;
+SELECT (pg_ripple.infer_with_stats('sg_plain') ->> 'derived')::bigint >= 2
+    AS sg_plain_stats_populates_provenance;
+ sg_plain_stats_populates_provenance 
+-------------------------------------
+ t
+(1 row)
+
+SET pg_ripple.block_on_conflict = on;
+SELECT pg_temp.catch_error('SELECT pg_ripple.infer(''sg_plain'')')
+    LIKE '%PT0451%' AS sg_plain_infer_gate_fires_with_provenance;
+ sg_plain_infer_gate_fires_with_provenance 
+-------------------------------------------
+ t
+(1 row)
+
+SET pg_ripple.block_on_conflict = off;
+-- ══════════════════════════════════════════════════════════════════════════════
+-- SRC-GATE-7: remove_rule() retracts derived facts — the
+-- "DELETE ... AND source = 1" path becomes effective.
+-- ══════════════════════════════════════════════════════════════════════════════
+SELECT pg_ripple.drop_rules('sg_dred') >= 0 AS sg_dred_rules_dropped;
+ sg_dred_rules_dropped 
+-----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val197.test/tag> "derived" :- ?x <https://val197.test/base> "1" .',
+    'sg_dred'
+) = 1 AS sg_dred_rule_loaded;
+ sg_dred_rule_loaded 
+---------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val197.test/Node4>',
+    '<https://val197.test/base>',
+    '"1"'
+) >= 1 AS sg_dred_base_inserted;
+ sg_dred_base_inserted 
+-----------------------
+ t
+(1 row)
+
+SELECT (pg_ripple.infer_with_stats('sg_dred') ->> 'derived')::bigint >= 1
+    AS sg_dred_stats_derived_fact;
+ sg_dred_stats_derived_fact 
+----------------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS sg_dred_derived_row_has_source_1
+FROM _pg_ripple.vp_rare
+WHERE p = (SELECT id FROM _pg_ripple.dictionary
+           WHERE value = 'https://val197.test/tag')
+  AND source = 1;
+ sg_dred_derived_row_has_source_1 
+----------------------------------
+ t
+(1 row)
+
+SELECT pg_ripple.remove_rule(
+    (SELECT id FROM _pg_ripple.rules
+     WHERE rule_set = 'sg_dred' AND active = true)
+) >= 1 AS sg_dred_remove_rule_retracts_derived;
+ sg_dred_remove_rule_retracts_derived 
+--------------------------------------
+ t
+(1 row)
+
+-- The derived fact is gone (pre-fix the source = 1 filter deleted nothing).
+SELECT count(*) = 0 AS sg_dred_derived_fact_gone
+FROM _pg_ripple.vp_rare
+WHERE p = (SELECT id FROM _pg_ripple.dictionary
+           WHERE value = 'https://val197.test/tag')
+  AND source = 1;
+ sg_dred_derived_fact_gone 
+---------------------------
+ t
+(1 row)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Cleanup — keep the suite namespace-clean for the other tests.
+-- ══════════════════════════════════════════════════════════════════════════════
+SET pg_ripple.record_derivations = off;
+SET pg_ripple.block_on_conflict = off;
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT p.id,
+               p.table_oid IS NOT NULL AS has_dedicated
+        FROM _pg_ripple.predicates p
+        JOIN _pg_ripple.dictionary d ON d.id = p.id
+        WHERE d.value LIKE 'https://val197.test/%'
+    LOOP
+        EXECUTE format('DELETE FROM _pg_ripple.vp_rare WHERE p = %s', r.id);
+        IF r.has_dedicated THEN
+            EXECUTE format('DELETE FROM _pg_ripple.vp_%s_delta', r.id);
+        END IF;
+    END LOOP;
+
+    DELETE FROM _pg_ripple.derivations
+    WHERE rule_set IN ('sg_flag', 'sg_dep', 'sg_block', 'sg_plain', 'sg_dred');
+END;
+$$;
+SELECT pg_ripple.drop_rules('sg_flag') >= 0 AS sg_flag_cleanup;
+ sg_flag_cleanup 
+-----------------
+ t
+(1 row)
+
+SELECT pg_ripple.drop_rules('sg_dep') >= 0 AS sg_dep_cleanup;
+ sg_dep_cleanup 
+----------------
+ t
+(1 row)
+
+SELECT pg_ripple.drop_rules('sg_block') >= 0 AS sg_block_cleanup;
+ sg_block_cleanup 
+------------------
+ t
+(1 row)
+
+SELECT pg_ripple.drop_rules('sg_plain') >= 0 AS sg_plain_cleanup;
+ sg_plain_cleanup 
+------------------
+ t
+(1 row)
+
+SELECT pg_ripple.drop_rules('sg_dred') >= 0 AS sg_dred_cleanup;
+ sg_dred_cleanup 
+-----------------
+ t
+(1 row)
+

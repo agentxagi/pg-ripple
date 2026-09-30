@@ -304,7 +304,7 @@ fn collect_derivation_chain(sid: i64, depth: i32, rows: &mut Vec<InferenceRow>) 
         let r = client.select(
             "SELECT rule_id, source_sids \
              FROM _pg_ripple.rule_firing_log \
-             WHERE produced_sid = $1 \
+             WHERE output_sid = $1 \
              ORDER BY fired_at DESC \
              LIMIT 1",
             None,

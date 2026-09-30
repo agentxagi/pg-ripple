@@ -28,6 +28,23 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ### Fixed
 
+- **Datalog inference stored derived triples as explicit (`vp_rare.source = 0`).**
+  All four materialisation INSERTs (`run_inference_seminaive`, `run_seminaive_inner`,
+  magic sets, WFS) omitted the `source` column, so every derived fact inherited the
+  default `0 = explicit`. `rule_conflicts(ruleset, 'runtime')` joins
+  `_pg_ripple.derivations` with `vp_rare … WHERE source = 1`, so the runtime scan
+  never found a contradiction and the `block_on_conflict` gate (PT0451) could not
+  fire since v0.103.0. DRed retraction (`DELETE … AND source = 1` in
+  `construct_rules/retract.rs` and `remove_rule`) and `justify()`/`explain`
+  (same `source = 1` filter) never matched a derived row either. Materialisation
+  now writes `source = 1` (`ON CONFLICT DO NOTHING` keeps an asserted row at 0),
+  and `infer_with_stats` gained the same conflict post-check as `infer`.
+  Observed in production on 2026-09-29: 1 629 rows in `vp_rare`, zero with
+  `source = 1`; all 564 derivation records pointed at `source = 0` rows.
+  Pinned by `tests/pg_regress/v0129_vp_rare_source_gate`. Known limit: the plain
+  `infer()` path still records no derivations, so its PT0451 post-check stays
+  inert until the write path records provenance (VAL-187 option (A), pending).
+
 - **`drain_dead_letter_queue()` deleted one row, not the queue.** It used
   `Spi::get_one` on `DELETE … RETURNING 1`; `get_one` asks SPI for a single row and
   SPI stops executing the command once the limit is reached, so exactly one row was
