@@ -16,24 +16,53 @@ use pgrx::prelude::*;
 
 // ─── Derivation recording ─────────────────────────────────────────────────────
 
+/// Storage locations a rule's derived rows occupy for provenance recording.
+pub(crate) struct DerivationTargets {
+    /// FROM-able source of this run's newly derived `(s, o, g)` rows: a temp
+    /// fixpoint table name (semi-naive) or a parenthesised query over the
+    /// canonical delta storage filtered to inferred rows (plain path).
+    pub delta_table: String,
+    /// Parenthesised query projecting `(i, s, o, g)` of the materialised rows
+    /// — the storage the recording joins against to resolve `derived_sid`.
+    pub sid_source: String,
+}
+
+/// Canonical storage of derived rows for `pred_id`: the promoted HTAP delta
+/// when the predicate has a dedicated VP table, `vp_rare` otherwise (VAL-207
+/// CANON-TARGET — both inference paths materialise into one storage, so the
+/// recording resolves `derived_sid` where the row actually lives).
+pub(crate) fn canonical_sid_source(pred_id: i64) -> String {
+    match crate::storage::vp_rare_io::get_dedicated_vp_table(pred_id) {
+        Some(view) => format!("(SELECT i, s, o, g FROM {view}_delta)"),
+        None => format!("(SELECT i, s, o, g FROM _pg_ripple.vp_rare WHERE p = {pred_id})"),
+    }
+}
+
 /// Record derivation provenance for a single rule invocation.
 ///
-/// Called during the semi-naive fixpoint, BEFORE delta tables are dropped,
-/// so the delta tables can be used to filter to newly-derived triples only.
-///
-/// `delta_table_fn` maps a predicate ID to the name of its delta temp table
-/// (e.g. `pred_id ↦ "_dl_delta_{pred_id}"`).  The delta table is used as the
-/// filter so we record derivations only for triples that were newly derived in
-/// this inference run, not for pre-existing base facts that happen to match the
-/// rule head.
-pub fn record_rule_derivations_with_delta<F>(rule: &super::Rule, rule_set: &str, delta_table_fn: &F)
+/// `targets_fn` maps the rule's head predicate to the storage pair describing
+/// where this run's derived rows sit; returning `None` skips recording for
+/// that head (e.g. temp delta table not created).
+pub fn record_rule_derivations_with_targets<F>(rule: &super::Rule, rule_set: &str, targets_fn: &F)
 where
-    F: Fn(i64) -> Option<String>,
+    F: Fn(i64) -> Option<DerivationTargets>,
 {
     if !crate::RECORD_DERIVATIONS.get() {
         return;
     }
-    let Some(sql) = compile_antecedent_insert_via_delta(rule, rule_set, delta_table_fn) else {
+    let Some(head) = &rule.head else {
+        return;
+    };
+    let head_pred = match &head.p {
+        super::Term::Const(id) => *id,
+        _ => return,
+    };
+    let Some(targets) = targets_fn(head_pred) else {
+        return;
+    };
+    let Some(sql) =
+        compile_antecedent_insert_with_targets(rule, rule_set, &targets.delta_table, &targets.sid_source)
+    else {
         return;
     };
     if let Err(e) = Spi::run_with_args(&sql, &[]) {
@@ -41,220 +70,23 @@ where
     }
 }
 
-/// Kept for backward-compatibility; delegates to the delta-table variant with
-/// an always-None mapper (effectively a no-op without delta context).
-#[allow(dead_code)]
-pub fn record_rule_derivations(rule: &super::Rule, rule_set: &str) {
-    record_rule_derivations_with_delta(rule, rule_set, &|_| None);
-}
-
-/// Generate the SQL INSERT into `_pg_ripple.derivations` for one rule.
+/// Build the SQL INSERT into `_pg_ripple.derivations` for one rule.
 ///
-/// Returns `None` for rules we cannot handle (recursive, variable predicates,
-/// no head, complex head expressions that would require more than simple joins).
+/// `delta_table` restricts the recording to rows derived by this run (the
+/// fixpoint temp delta, or the plain path's inferred-only delta query).
+/// `sid_source` is the storage holding the materialised rows — the canonical
+/// delta for promoted predicates, `vp_rare` for rare ones (VAL-207).  Body
+/// atoms are read through [`vp_sid_read_expr`], so antecedents living in
+/// dedicated VP tables (production: depends_on → vp_534) resolve to SIDs.
 ///
-/// Superseded by [`compile_antecedent_insert_via_delta`]; retained for reference.
-#[allow(dead_code)]
-fn compile_antecedent_insert(rule: &super::Rule, rule_set: &str) -> Option<String> {
-    use super::{BodyLiteral, Term};
-
-    let head = rule.head.as_ref()?;
-
-    // Head predicate must be a constant.
-    let head_pred = match &head.p {
-        Term::Const(id) => *id,
-        _ => return None,
-    };
-
-    // Skip recursive rules — antecedent tracking for recursive rules would
-    // require unwinding the CTE-based evaluation, which is out of scope here.
-    let is_recursive = rule.body.iter().any(|lit| {
-        if let BodyLiteral::Positive(atom) = lit {
-            matches!(&atom.p, Term::Const(p) if *p == head_pred)
-        } else {
-            false
-        }
-    });
-    if is_recursive {
-        // Fall back to recording with empty antecedent_sids.
-        return record_recursive_rule_stub(rule, rule_set);
-    }
-
-    // Collect positive body atoms (skip negated / arithmetic / compare literals).
-    let pos_atoms: Vec<&super::Atom> = rule
-        .body
-        .iter()
-        .filter_map(|lit| {
-            if let BodyLiteral::Positive(a) = lit {
-                Some(a)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if pos_atoms.is_empty() {
-        return None;
-    }
-
-    // All body atom predicates must be constants.
-    for atom in &pos_atoms {
-        if !matches!(atom.p, Term::Const(_)) {
-            return None;
-        }
-    }
-
-    // Build FROM/JOIN clauses and track variable bindings.
-    // var_map: variable name → SQL expression that produced it.
-    let mut var_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut from_join_parts: Vec<String> = Vec::new();
-    let mut bid_columns: Vec<String> = Vec::new();
-
-    for (idx, atom) in pos_atoms.iter().enumerate() {
-        let pred_id = match &atom.p {
-            Term::Const(id) => *id,
-            _ => return None,
-        };
-
-        let alias = format!("b{idx}");
-        // Include `i` column for SID capture.
-        let table_expr =
-            format!("(SELECT s, o, g, i FROM _pg_ripple.vp_rare WHERE p = {pred_id}) AS {alias}");
-
-        bid_columns.push(format!("{alias}.i"));
-
-        let mut join_conds: Vec<String> = Vec::new();
-
-        // Subject
-        match &atom.s {
-            Term::Var(v) => {
-                if let Some(existing) = var_map.get(v.as_str()) {
-                    join_conds.push(format!("{alias}.s = {existing}"));
-                } else {
-                    var_map.insert(v.clone(), format!("{alias}.s"));
-                }
-            }
-            Term::Const(id) => {
-                join_conds.push(format!("{alias}.s = {id}"));
-            }
-            _ => {}
-        }
-
-        // Object
-        match &atom.o {
-            Term::Var(v) => {
-                if let Some(existing) = var_map.get(v.as_str()) {
-                    join_conds.push(format!("{alias}.o = {existing}"));
-                } else {
-                    var_map.insert(v.clone(), format!("{alias}.o"));
-                }
-            }
-            Term::Const(id) => {
-                join_conds.push(format!("{alias}.o = {id}"));
-            }
-            _ => {}
-        }
-
-        // Graph (optional — we allow any graph for the body scan)
-        match &atom.g {
-            Term::Var(v) => {
-                if let Some(existing) = var_map.get(v.as_str()) {
-                    join_conds.push(format!("{alias}.g = {existing}"));
-                } else {
-                    var_map.insert(v.clone(), format!("{alias}.g"));
-                }
-            }
-            Term::Const(id) => {
-                join_conds.push(format!("{alias}.g = {id}"));
-            }
-            _ => {}
-        }
-
-        if idx == 0 {
-            from_join_parts.push(format!("FROM {table_expr}"));
-        } else if join_conds.is_empty() {
-            from_join_parts.push(format!("CROSS JOIN {table_expr}"));
-        } else {
-            from_join_parts.push(format!("JOIN {table_expr} ON {}", join_conds.join(" AND ")));
-        }
-    }
-
-    // Resolve head subject and object from var_map.
-    let head_s_sql = match &head.s {
-        Term::Var(v) => var_map.get(v.as_str()).cloned()?,
-        Term::Const(id) => id.to_string(),
-        _ => return None,
-    };
-    let head_o_sql = match &head.o {
-        Term::Var(v) => var_map.get(v.as_str()).cloned()?,
-        Term::Const(id) => id.to_string(),
-        _ => return None,
-    };
-    let head_g_sql = match &head.g {
-        Term::Var(v) => var_map
-            .get(v.as_str())
-            .cloned()
-            .unwrap_or_else(|| "0".to_owned()),
-        Term::Const(id) => id.to_string(),
-        Term::DefaultGraph => "0".to_owned(),
-        Term::Wildcard => "0".to_owned(),
-    };
-
-    let from_join_sql = from_join_parts.join("\n  ");
-    let antecedent_array = if bid_columns.is_empty() {
-        "ARRAY[]::BIGINT[]".to_owned()
-    } else {
-        format!("ARRAY[{}]::BIGINT[]", bid_columns.join(", "))
-    };
-
-    // Escape single quotes in rule text / rule_set for embedding in SQL.
-    let rule_name_esc = rule.rule_text.replace('\'', "''");
-    let rule_set_esc = rule_set.replace('\'', "''");
-
-    // Build the INSERT … SELECT.
-    // The inner SELECT re-runs the rule body and joins with vp_rare (source=1
-    // = inferred) on the head to obtain derived_sid.
-    let sql = format!(
-        "INSERT INTO _pg_ripple.derivations \
-           (derived_sid, rule_name, rule_set, antecedent_sids) \
-         SELECT \
-           vr_head.i, \
-           '{rule_name_esc}'::text, \
-           '{rule_set_esc}'::text, \
-           {antecedent_array} \
-         {from_join_sql} \
-         JOIN (SELECT i, s, o, g FROM _pg_ripple.vp_rare \
-               WHERE p = {head_pred} AND source = 1) vr_head \
-           ON vr_head.s = {head_s_sql} \
-          AND vr_head.o = {head_o_sql} \
-          AND vr_head.g = {head_g_sql} \
-         ON CONFLICT (derived_sid, rule_name) DO NOTHING"
-    );
-
-    Some(sql)
-}
-
-/// Delta-table variant of [`compile_antecedent_insert`].
-///
-/// Uses the delta temp-table returned by `delta_table_fn(head_pred)` — which
-/// contains only the (s, o, g) rows newly derived in this inference run — to
-/// join against `vp_rare` and obtain the correct SIDs.  Since v0.129.0
-/// (CONFLICT-03) materialised triples carry `source = 1`, so the base
-/// variant's `source = 1` filter matches too; this variant remains the
-/// preferred path during semi-naive recording because it restricts the join
-/// to rows actually derived by this run instead of rescanning `vp_rare`.
-///
-/// Returns `None` when:
-/// - `delta_table_fn` returns `None` for the head predicate (no delta context)
-/// - the rule cannot be translated (recursive head, variable predicates, etc.)
-fn compile_antecedent_insert_via_delta<F>(
+/// Returns `None` when the rule cannot be translated (recursive heads use the
+/// stub, variable predicates, etc.).
+fn compile_antecedent_insert_with_targets(
     rule: &super::Rule,
     rule_set: &str,
-    delta_table_fn: &F,
-) -> Option<String>
-where
-    F: Fn(i64) -> Option<String>,
-{
+    delta_table: &str,
+    sid_source: &str,
+) -> Option<String> {
     use super::{BodyLiteral, Term};
 
     let head = rule.head.as_ref()?;
@@ -264,9 +96,6 @@ where
         Term::Const(id) => *id,
         _ => return None,
     };
-
-    // Delta table must be available for this predicate.
-    let delta_table = delta_table_fn(head_pred)?;
 
     // Skip recursive rules — use delta-aware stub instead.
     let is_recursive = rule.body.iter().any(|lit| {
@@ -277,7 +106,7 @@ where
         }
     });
     if is_recursive {
-        return record_recursive_rule_stub_via_delta(rule, rule_set, &delta_table);
+        return record_recursive_rule_stub(rule, rule_set, delta_table, sid_source);
     }
 
     // Collect positive body atoms.
@@ -314,8 +143,10 @@ where
             _ => return None,
         };
         let alias = format!("b{idx}");
-        let table_expr =
-            format!("(SELECT s, o, g, i FROM _pg_ripple.vp_rare WHERE p = {pred_id}) AS {alias}");
+        let table_expr = format!(
+            "{} AS {alias}",
+            super::compiler::vp_sid_read_expr(pred_id)
+        );
         bid_columns.push(format!("{alias}.i"));
 
         let mut join_conds: Vec<String> = Vec::new();
@@ -395,8 +226,8 @@ where
     let rule_name_esc = rule.rule_text.replace('\'', "''");
     let rule_set_esc = rule_set.replace('\'', "''");
 
-    // Join delta temp-table (s,o,g) against vp_rare to get SIDs for
-    // newly-derived head triples.
+    // Join this run's delta rows against the canonical storage to get SIDs
+    // for newly-derived head triples.
     let sql = format!(
         "INSERT INTO _pg_ripple.derivations \
            (derived_sid, rule_name, rule_set, antecedent_sids) \
@@ -408,8 +239,8 @@ where
          {from_join_sql} \
          JOIN (SELECT vr.i, vr.s, vr.o, vr.g \
                FROM {delta_table} dt \
-               JOIN _pg_ripple.vp_rare vr \
-                 ON vr.p = {head_pred} AND vr.s = dt.s AND vr.o = dt.o AND vr.g = dt.g \
+               JOIN {sid_source} vr \
+                 ON vr.s = dt.s AND vr.o = dt.o AND vr.g = dt.g \
               ) vr_head \
            ON vr_head.s = {head_s_sql} \
           AND vr_head.o = {head_o_sql} \
@@ -421,18 +252,13 @@ where
 }
 
 /// Stub for recursive rules when a delta table is available.
-fn record_recursive_rule_stub_via_delta(
+fn record_recursive_rule_stub(
     rule: &super::Rule,
     rule_set: &str,
     delta_table: &str,
+    sid_source: &str,
 ) -> Option<String> {
-    use super::Term;
-
-    let head = rule.head.as_ref()?;
-    let head_pred = match &head.p {
-        Term::Const(id) => *id,
-        _ => return None,
-    };
+    rule.head.as_ref()?;
 
     let rule_name_esc = rule.rule_text.replace('\'', "''");
     let rule_set_esc = rule_set.replace('\'', "''");
@@ -442,39 +268,8 @@ fn record_recursive_rule_stub_via_delta(
            (derived_sid, rule_name, rule_set, antecedent_sids) \
          SELECT vr.i, '{rule_name_esc}'::text, '{rule_set_esc}'::text, ARRAY[]::BIGINT[] \
          FROM {delta_table} dt \
-         JOIN _pg_ripple.vp_rare vr \
-           ON vr.p = {head_pred} AND vr.s = dt.s AND vr.o = dt.o AND vr.g = dt.g \
-         ON CONFLICT (derived_sid, rule_name) DO NOTHING"
-    );
-
-    Some(sql)
-}
-
-/// For recursive rules we cannot easily reconstruct antecedents, so we write a
-/// stub row with an empty antecedent_sids array.  `justify()` will still show
-/// the rule name even without antecedents.
-///
-/// Superseded by [`record_recursive_rule_stub_via_delta`]; retained for reference.
-#[allow(dead_code)]
-fn record_recursive_rule_stub(rule: &super::Rule, rule_set: &str) -> Option<String> {
-    use super::Term;
-
-    let head = rule.head.as_ref()?;
-    let head_pred = match &head.p {
-        Term::Const(id) => *id,
-        _ => return None,
-    };
-
-    let rule_name_esc = rule.rule_text.replace('\'', "''");
-    let rule_set_esc = rule_set.replace('\'', "''");
-
-    // Insert stubs for all inferred triples with this head predicate.
-    let sql = format!(
-        "INSERT INTO _pg_ripple.derivations \
-           (derived_sid, rule_name, rule_set, antecedent_sids) \
-         SELECT vr.i, '{rule_name_esc}'::text, '{rule_set_esc}'::text, ARRAY[]::BIGINT[] \
-         FROM _pg_ripple.vp_rare vr \
-         WHERE vr.p = {head_pred} AND vr.source = 1 \
+         JOIN {sid_source} vr \
+           ON vr.s = dt.s AND vr.o = dt.o AND vr.g = dt.g \
          ON CONFLICT (derived_sid, rule_name) DO NOTHING"
     );
 
@@ -489,19 +284,75 @@ fn record_recursive_rule_stub(rule: &super::Rule, rule_set: &str) -> Option<Stri
 ///
 /// Returns the number of rows removed.
 pub fn vacuum_orphan_derivations() -> i64 {
-    // A derived_sid is orphaned when it does not appear in vp_rare (any source)
-    // and does not appear in the `i` column of any dedicated VP table.
-    // For simplicity we check vp_rare.i only (dedicated VP deltas are mirrored
-    // in vp_rare after merge; inferred triples always live in vp_rare).
-    let sql = "WITH deleted AS ( \
-        DELETE FROM _pg_ripple.derivations d \
-        WHERE NOT EXISTS ( \
-            SELECT 1 FROM _pg_ripple.vp_rare vr WHERE vr.i = d.derived_sid \
-        ) \
-        RETURNING 1 \
-    ) SELECT COUNT(*)::bigint FROM deleted";
+    // A derived_sid is orphaned when it no longer resolves in any live
+    // storage: `vp_rare` or any promoted predicate's `vp_{id}` view
+    // (main − tombstones ∪ delta).  VAL-207 CANON-TARGET: derived rows for
+    // promoted predicates canonicalise in `{vp}_delta`, so a vp_rare-only
+    // check would delete provenance of live facts.
+    let live = live_sids_expr();
+    let sql = format!(
+        "WITH deleted AS ( \
+         DELETE FROM _pg_ripple.derivations d \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM {live} lr WHERE lr.i = d.derived_sid \
+         ) \
+         RETURNING 1 \
+     ) SELECT COUNT(*)::bigint FROM deleted"
+    );
 
-    Spi::get_one::<i64>(sql).unwrap_or(None).unwrap_or(0)
+    Spi::get_one::<i64>(&sql).unwrap_or(None).unwrap_or(0)
+}
+
+/// Parenthesised UNION of every live SID source: `vp_rare` plus each promoted
+/// predicate's `vp_{id}` view.  Shared by storage-agnostic SID existence
+/// checks (derivation vacuum, conflict scan).
+pub(crate) fn live_sids_expr() -> String {
+    let promoted: Vec<String> = Spi::connect(|c| {
+        Ok::<Vec<String>, pgrx::spi::SpiError>(
+            c.select(
+                "SELECT id::text FROM _pg_ripple.predicates WHERE table_oid IS NOT NULL",
+                None,
+                &[],
+            )?
+            .filter_map(|row| row.get::<String>(1).ok().flatten())
+            .collect(),
+        )
+    })
+    .unwrap_or_default();
+    let mut arms = vec!["SELECT i FROM _pg_ripple.vp_rare".to_owned()];
+    for id in promoted {
+        arms.push(format!("SELECT i FROM _pg_ripple.vp_{id}"));
+    }
+    format!("({})", arms.join(" UNION ALL "))
+}
+
+/// Parenthesised UNION of every DERIVED row across storages, projecting
+/// `(i, s, o, p, g)`: `vp_rare` rows with `source = 1` plus each promoted
+/// predicate's `{vp}_delta` rows with `source = 1` (predicate synthesised
+/// from the table name — delta tables have no `p` column).
+///
+/// Consumers of "inferred triples" that must follow the canonical storage
+/// (runtime conflict scan, inference explain) read through this expression.
+pub(crate) fn derived_rows_expr() -> String {
+    let promoted: Vec<String> = Spi::connect(|c| {
+        Ok::<Vec<String>, pgrx::spi::SpiError>(
+            c.select(
+                "SELECT id::text FROM _pg_ripple.predicates WHERE table_oid IS NOT NULL",
+                None,
+                &[],
+            )?
+            .filter_map(|row| row.get::<String>(1).ok().flatten())
+            .collect(),
+        )
+    })
+    .unwrap_or_default();
+    let mut arms = vec!["SELECT i, s, o, p, g FROM _pg_ripple.vp_rare WHERE source = 1".to_owned()];
+    for id in promoted {
+        arms.push(format!(
+            "SELECT i, s, o, {id}, g FROM _pg_ripple.vp_{id}_delta WHERE source = 1"
+        ));
+    }
+    format!("({})", arms.join(" UNION ALL "))
 }
 
 // ─── proof-tree builder ───────────────────────────────────────────────────────
@@ -557,14 +408,31 @@ fn batch_decode(ids: &[i64]) -> std::collections::HashMap<i64, String> {
 }
 
 /// Look up the `vp_rare.i` (SID) for a triple `(s_id, p_id, o_id)`.
+///
+/// VAL-207: checks `vp_rare` first (legacy lookup order), then the predicate's
+/// promoted `vp_{id}` view when one exists — the view carries main −
+/// tombstones plus the delta inbox, so facts materialised in `{vp}_delta` are
+/// reachable by the graph-blind `justify()`, exactly as the graph-scoped
+/// variant reads them.
 fn sid_for_triple(s_id: i64, p_id: i64, o_id: i64) -> Option<i64> {
-    Spi::get_one_with_args::<i64>(
+    let rare = Spi::get_one_with_args::<i64>(
         "SELECT i FROM _pg_ripple.vp_rare WHERE p = $1 AND s = $2 AND o = $3 LIMIT 1",
         &[
             DatumWithOid::from(p_id),
             DatumWithOid::from(s_id),
             DatumWithOid::from(o_id),
         ],
+    )
+    .ok()
+    .flatten();
+    if rare.is_some() {
+        return rare;
+    }
+
+    let view = crate::storage::vp_rare_io::get_dedicated_vp_table(p_id)?;
+    Spi::get_one_with_args::<i64>(
+        &format!("SELECT i FROM {view} WHERE s = $1 AND o = $2 ORDER BY i LIMIT 1"),
+        &[DatumWithOid::from(s_id), DatumWithOid::from(o_id)],
     )
     .ok()
     .flatten()
@@ -591,20 +459,12 @@ fn derivations_for_sid(sid: i64) -> Vec<(String, String, Vec<i64>)> {
 }
 
 /// Get the triple `(p, s, o)` for a given SID from vp_rare.
+///
+/// VAL-207: delegates to the cross-storage [`triple_ids_for_sid`] — with
+/// canonical delta materialisation, a derived SID for a promoted predicate
+/// resolves in `{vp}_delta`/main, not `vp_rare`.
 fn triple_for_sid(sid: i64) -> Option<(i64, i64, i64)> {
-    let sql = "SELECT p, s, o FROM _pg_ripple.vp_rare WHERE i = $1 LIMIT 1";
-    Spi::connect(|client| {
-        client
-            .select(sql, None, &[DatumWithOid::from(sid)])
-            .unwrap_or_else(|e| pgrx::error!("triple for SID SPI error: {e}"))
-            .next()
-            .and_then(|row| {
-                let p = row.get::<i64>(1).ok().flatten()?;
-                let s = row.get::<i64>(2).ok().flatten()?;
-                let o = row.get::<i64>(3).ok().flatten()?;
-                Some((p, s, o))
-            })
-    })
+    triple_ids_for_sid(sid)
 }
 
 /// Recursively build the JSONB proof tree for a given SID.

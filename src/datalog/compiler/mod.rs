@@ -87,16 +87,7 @@ pub fn vp_read_expr_pub(pred_id: i64) -> String {
 }
 
 pub(super) fn vp_read_expr(pred_id: i64) -> String {
-    let has_dedicated = pgrx::Spi::get_one_with_args::<i64>(
-        "SELECT table_oid::bigint FROM _pg_ripple.predicates \
-         WHERE id = $1 AND table_oid IS NOT NULL",
-        &[DatumWithOid::from(pred_id)],
-    )
-    .ok()
-    .flatten()
-    .is_some();
-
-    if has_dedicated {
+    if has_dedicated_vp(pred_id) {
         // Union dedicated view with any un-promoted vp_rare rows so that both
         // existing data (still in vp_rare) and newly derived data (in the delta
         // table) are visible to the rule body.
@@ -108,6 +99,37 @@ pub(super) fn vp_read_expr(pred_id: i64) -> String {
     } else {
         // Pure rare predicate: all data lives in vp_rare.
         format!("(SELECT s, o, g FROM _pg_ripple.vp_rare WHERE p = {pred_id})")
+    }
+}
+
+/// Does `pred_id` have a dedicated HTAP VP table (`predicates.table_oid`)?
+/// Single SPI probe shared by every read-expression builder.
+pub(crate) fn has_dedicated_vp(pred_id: i64) -> bool {
+    pgrx::Spi::get_one_with_args::<i64>(
+        "SELECT table_oid::bigint FROM _pg_ripple.predicates \
+         WHERE id = $1 AND table_oid IS NOT NULL",
+        &[DatumWithOid::from(pred_id)],
+    )
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// Like [`vp_read_expr`] but also projects the statement id `i`, so callers can
+/// resolve SIDs of matching rows (derivation recording, justification).
+///
+/// Reads the same storages rule bodies read: for promoted predicates the
+/// dedicated view (main − tombstones ∪ delta) UNIONed with any remaining
+/// `vp_rare` rows; for rare predicates, `vp_rare` alone.
+pub(crate) fn vp_sid_read_expr(pred_id: i64) -> String {
+    if has_dedicated_vp(pred_id) {
+        format!(
+            "(SELECT s, o, g, i FROM _pg_ripple.vp_{pred_id} \
+              UNION ALL \
+              SELECT s, o, g, i FROM _pg_ripple.vp_rare WHERE p = {pred_id})"
+        )
+    } else {
+        format!("(SELECT s, o, g, i FROM _pg_ripple.vp_rare WHERE p = {pred_id})")
     }
 }
 
@@ -443,33 +465,15 @@ pub fn compile_rule_set(rules: &[Rule]) -> Result<Vec<String>, String> {
 /// Compile a single rule inserting into `target` (with columns `(s, o, g)`).
 /// Used by semi-naive inference to target temp tables instead of HTAP delta tables.
 pub fn compile_single_rule_to(rule: &Rule, target: &str) -> Result<String, String> {
-    let head = rule
-        .head
-        .as_ref()
-        .ok_or_else(|| "cannot compile constraint rule as INSERT".to_owned())?;
-
-    let head_pred = match &head.p {
-        Term::Const(id) => *id,
-        Term::Var(_) => return Err("variable predicate in rule head is not supported".to_owned()),
-        _ => return Err("invalid predicate term in rule head".to_owned()),
-    };
-
-    let head_g_expr = match &head.g {
-        Term::Const(id) => const_sql(*id),
-        Term::Var(v) => format!("g_var_{v}"),
-        Term::DefaultGraph => "0".to_owned(),
-        Term::Wildcard => "0".to_owned(),
-    };
-
-    let is_recursive = is_recursive_rule(rule, head_pred);
-    if is_recursive {
-        sql::compile_recursive_rule(rule, head_pred, &head_g_expr, target)
-    } else {
-        compile_nonrecursive_rule(rule, head_pred, &head_g_expr, target)
-    }
+    compile_single_rule_inner(rule, target, false)
 }
 
 /// Compile a single derivation rule to a SQL INSERT statement.
+///
+/// The insert target is the head predicate's HTAP delta table (created
+/// on-demand for predicates without a dedicated VP table), and rows are
+/// materialised as inferred (`source = 1`) — the plain inference path writes
+/// the same storage and provenance class as the semi-naive fixpoint (VAL-207).
 pub fn compile_single_rule(rule: &Rule) -> Result<String, String> {
     let head = rule
         .head
@@ -482,7 +486,39 @@ pub fn compile_single_rule(rule: &Rule) -> Result<String, String> {
         _ => return Err("invalid predicate term in rule head".to_owned()),
     };
 
-    // Determine head graph column: constant or variable.
+    // For new predicates without a dedicated VP table, create the HTAP split
+    // on-demand so the INSERT does not fail with "relation does not exist".
+    // (v0.29.0 bug fix: pre-existing infer() path used compile_single_rule
+    // which always targeted the delta table, even for new predicates.)
+    if !has_dedicated_vp(head_pred) {
+        crate::storage::merge::ensure_htap_tables(head_pred);
+    }
+    let target = format!("{}_delta", vp_table(head_pred));
+
+    compile_single_rule_inner(rule, &target, true)
+}
+
+/// Shared body of [`compile_single_rule`] / [`compile_single_rule_to`].
+///
+/// `mark_inferred` appends the `source` column with value `1` to the INSERT —
+/// only valid for HTAP delta targets (temp fixpoint tables have no `source`
+/// column).
+fn compile_single_rule_inner(
+    rule: &Rule,
+    target: &str,
+    mark_inferred: bool,
+) -> Result<String, String> {
+    let head = rule
+        .head
+        .as_ref()
+        .ok_or_else(|| "cannot compile constraint rule as INSERT".to_owned())?;
+
+    let head_pred = match &head.p {
+        Term::Const(id) => *id,
+        Term::Var(_) => return Err("variable predicate in rule head is not supported".to_owned()),
+        _ => return Err("invalid predicate term in rule head".to_owned()),
+    };
+
     let head_g_expr = match &head.g {
         Term::Const(id) => const_sql(*id),
         Term::Var(v) => format!("g_var_{v}"),
@@ -490,31 +526,11 @@ pub fn compile_single_rule(rule: &Rule) -> Result<String, String> {
         Term::Wildcard => "0".to_owned(),
     };
 
-    // Determine if rule is recursive (head pred appears in body).
     let is_recursive = is_recursive_rule(rule, head_pred);
-
-    // Target table: use delta for HTAP tables.
-    // For new predicates without a dedicated VP table, create the HTAP split
-    // on-demand so the INSERT does not fail with "relation does not exist".
-    // (v0.29.0 bug fix: pre-existing infer() path used compile_single_rule
-    // which always targeted the delta table, even for new predicates.)
-    let has_dedicated = pgrx::Spi::get_one_with_args::<i64>(
-        "SELECT table_oid::bigint FROM _pg_ripple.predicates \
-         WHERE id = $1 AND table_oid IS NOT NULL",
-        &[DatumWithOid::from(head_pred)],
-    )
-    .ok()
-    .flatten()
-    .is_some();
-    if !has_dedicated {
-        crate::storage::merge::ensure_htap_tables(head_pred);
-    }
-    let target = format!("{}_delta", vp_table(head_pred));
-
     if is_recursive {
-        sql::compile_recursive_rule(rule, head_pred, &head_g_expr, &target)
+        sql::compile_recursive_rule(rule, head_pred, &head_g_expr, target, mark_inferred)
     } else {
-        compile_nonrecursive_rule(rule, head_pred, &head_g_expr, &target)
+        compile_nonrecursive_rule(rule, head_pred, &head_g_expr, target, mark_inferred)
     }
 }
 
@@ -546,6 +562,7 @@ fn compile_nonrecursive_rule(
     _head_pred: i64,
     _head_g_expr: &str,
     target: &str,
+    mark_inferred: bool,
 ) -> Result<String, String> {
     let head = rule
         .head
@@ -965,9 +982,18 @@ fn compile_nonrecursive_rule(
         format!("WHERE {}", where_clauses.join("\n  AND "))
     };
 
+    // VAL-207: plain-path INSERTs materialise rows as inferred (source = 1),
+    // matching the semi-naive fixpoint (CONFLICT-03) so conflict detection,
+    // DRed retraction and justification read one provenance class.
+    let (head_cols, head_source) = if mark_inferred {
+        ("s, o, g, source", ", 1")
+    } else {
+        ("s, o, g", "")
+    };
+
     Ok(format!(
-        "INSERT INTO {target} (s, o, g)\n\
-         SELECT {select_s}, {select_o}, {select_g}\n\
+        "INSERT INTO {target} ({head_cols})\n\
+         SELECT {select_s}, {select_o}, {select_g}{head_source}\n\
          FROM {from_str}\n\
          {where_str}\n\
          ON CONFLICT DO NOTHING"

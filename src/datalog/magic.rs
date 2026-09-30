@@ -607,32 +607,17 @@ fn run_magic_seminaive(
         }
     }
 
-    // Materialise derived triples into vp_rare.
+    // Materialise derived triples into the canonical storage.
     let mut total_derived = 0i64;
     for &pred_id in &derived_pred_ids {
         // v0.129.0 CONFLICT-03: materialise as inferred (source = 1); see the
         // matching comment in run_inference_seminaive.
-        let cnt = pgrx::Spi::get_one::<i64>(&format!(
-            "WITH ins AS ( \
-               INSERT INTO _pg_ripple.vp_rare (p, s, o, g, source) \
-               SELECT {pred_id}::bigint, s, o, g, 1 FROM _dl_delta_{pred_id} \
-               ON CONFLICT DO NOTHING \
-               RETURNING 1 \
-             ) SELECT COUNT(*)::bigint FROM ins"
-        ))
-        .unwrap_or(None)
-        .unwrap_or(0);
+        // v0.130.0 VAL-207: canonical storage (promoted delta when dedicated).
+        let cnt = crate::datalog::seminaive::materialise_derived_rows(
+            pred_id,
+            &format!("_dl_delta_{pred_id}"),
+        );
         total_derived += cnt;
-
-        if cnt > 0 {
-            let _ = pgrx::Spi::run_with_args(
-                "INSERT INTO _pg_ripple.predicates (id, table_oid, triple_count) \
-                 VALUES ($1, NULL, $2) \
-                 ON CONFLICT (id) DO UPDATE \
-                     SET triple_count = _pg_ripple.predicates.triple_count + EXCLUDED.triple_count",
-                &[DatumWithOid::from(pred_id), DatumWithOid::from(cnt)],
-            );
-        }
     }
 
     // Cleanup delta tables.

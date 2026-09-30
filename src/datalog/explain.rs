@@ -241,12 +241,17 @@ pub fn explain_inference_impl(s: &str, p: &str, o: &str, g: Option<&str>) -> Vec
     .unwrap_or(None)
     .unwrap_or(false);
 
-    // Find the statement ID for this triple in any VP table.
+    // Find the statement ID for this triple in any derived storage.
+    // v0.130.0 VAL-207: read the canonical derived-row union (vp_rare plus
+    // promoted deltas) instead of a vp_rare-only scan, and actually filter on
+    // the predicate (the previous form duplicated the arm and ignored p_id).
+    let derived = crate::datalog::derivations::derived_rows_expr();
     let sid: Option<i64> = Spi::get_one_with_args::<i64>(
-        "SELECT i FROM _pg_ripple.vp_rare WHERE s = $1 AND o = $3 AND g = $4 AND source = 1 \
-         UNION ALL \
-         SELECT i FROM _pg_ripple.vp_rare WHERE s = $1 AND o = $3 AND g = $4 AND source = 1 \
-         LIMIT 1",
+        &format!(
+            "SELECT vr.i FROM {derived} vr \
+             WHERE vr.s = $1 AND vr.p = $2 AND vr.o = $3 AND vr.g = $4 \
+             LIMIT 1"
+        ),
         &[
             DatumWithOid::from(s_id),
             DatumWithOid::from(p_id),
