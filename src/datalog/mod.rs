@@ -204,6 +204,10 @@ pub struct Rule {
     pub body: Vec<BodyLiteral>,
     /// Original text of this rule (for catalog storage).
     pub rule_text: String,
+    /// Optional `@name("label")` annotation (v0.131.0, VAL-208): the stable
+    /// identity stored as `_pg_ripple.derivations.rule_name`.  `None` falls
+    /// back to an auto-derived fingerprint of the rule text.
+    pub name: Option<String>,
     /// Optional `@weight(FLOAT)` annotation for probabilistic Datalog (v0.87.0).
     /// Value must be in [0.0, 1.0]. `None` means confidence 1.0 (deterministic).
     pub weight: Option<f64>,
@@ -218,6 +222,36 @@ pub struct RuleSet {
     pub rules: Vec<Rule>,
 }
 
+/// Stable identity of a rule for `_pg_ripple.derivations.rule_name` (VAL-208).
+///
+/// An explicit `@name("label")` wins.  Otherwise the name is
+/// `auto:<first 12 hex chars of md5(rule_text)>` — deterministic across
+/// reloads of the same text, and different for an edited rule (an edit is,
+/// logically, a new rule; [`store_rules`] prunes the vanished rule's
+/// derivations).
+pub(crate) fn rule_display_name(rule: &Rule) -> String {
+    if let Some(label) = &rule.name {
+        return label.clone();
+    }
+    use md5::{Digest, Md5};
+    let hex = hex::encode(Md5::digest(rule.rule_text.as_bytes()));
+    format!("auto:{}", &hex[..12])
+}
+
+/// Re-attach a catalog-stored rule name to freshly parsed rules (VAL-208).
+///
+/// The stored `rule_text` carries no `@name` annotation (the parser strips it
+/// before capture), so a reparse from the catalog loses the explicit label.
+/// Loaders call this with the row's `rules.name`; the label restores the rule's
+/// derivation identity.  Auto-named rules are unaffected — their fingerprint is
+/// a pure function of the text.
+pub(crate) fn attach_catalog_name(rules: &mut [Rule], name: Option<&str>) {
+    if let (Some(label), Some(first)) = (name, rules.first_mut())
+        && first.name.is_none()
+    {
+        first.name = Some(label.to_owned());
+    }
+}
 // ─── v0.106.0 / v0.107.0 — Temporal Operators ────────────────────────────────
 
 /// Temporal filter variants for Datalog rules (v0.106.0 + v0.107.0).
@@ -281,6 +315,7 @@ pub fn ensure_catalog() {
              id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
              rule_set      TEXT NOT NULL, \
              rule_text     TEXT NOT NULL, \
+             name          TEXT, \
              head_pred     BIGINT, \
              stratum       INT NOT NULL DEFAULT 0, \
              is_recursive  BOOLEAN NOT NULL DEFAULT false, \
@@ -290,6 +325,42 @@ pub fn ensure_catalog() {
         &[],
     )
     .unwrap_or_else(|e| pgrx::error!("rules table creation error: {e}"));
+
+    // VAL-208 (v0.131.0): stable per-rule identity.  `rules.name` carries the
+    // explicit @name label or the auto fingerprint; derivations reference it.
+    // Belt-and-suspenders for databases bootstrapped before the 0.131.0
+    // migration ran: add the column, backfill from rule_text, collapse
+    // duplicates (identical texts yield one name), then enforce uniqueness.
+    // One-shot: guarded by the column's presence so the hot path (every
+    // ensure_catalog call) neither ALTERs the table — which fails while a
+    // cursor holds the relation open — nor emits catalog-invalidation noise.
+    Spi::run_with_args(
+        "DO $$ \
+         BEGIN \
+             IF NOT EXISTS ( \
+                 SELECT 1 FROM pg_attribute \
+                  WHERE attrelid = '_pg_ripple.rules'::regclass \
+                    AND attname = 'name' AND NOT attisdropped) THEN \
+                 ALTER TABLE _pg_ripple.rules ADD COLUMN name TEXT; \
+                 UPDATE _pg_ripple.rules \
+                    SET name = 'auto:' || left(md5(rule_text), 12) \
+                  WHERE name IS NULL; \
+                 DELETE FROM _pg_ripple.rules r \
+                   USING _pg_ripple.rules r2 \
+                  WHERE r.rule_set = r2.rule_set \
+                    AND r.name = r2.name \
+                    AND r.id > r2.id; \
+             END IF; \
+             IF NOT EXISTS ( \
+                 SELECT 1 FROM pg_class \
+                  WHERE relname = 'uq_rules_set_name' AND relkind = 'i') THEN \
+                 CREATE UNIQUE INDEX uq_rules_set_name \
+                     ON _pg_ripple.rules (rule_set, name); \
+             END IF; \
+         END $$",
+        &[],
+    )
+    .unwrap_or_else(|e| pgrx::error!("rules name bootstrap error: {e}"));
 
     // _pg_ripple.rule_sets
     Spi::run_with_args(
@@ -408,11 +479,13 @@ pub fn store_rules(rule_set: &str, rules: &[Rule]) -> i64 {
 
             Spi::run_with_args(
                 "INSERT INTO _pg_ripple.rules \
-                     (rule_set, rule_text, head_pred, stratum, is_recursive) \
-                     VALUES ($1, $2, $3, $4, $5)",
+                     (rule_set, rule_text, name, head_pred, stratum, is_recursive) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (rule_set, name) DO NOTHING",
                 &[
                     pgrx::datum::DatumWithOid::from(rule_set),
                     pgrx::datum::DatumWithOid::from(rule.rule_text.as_str()),
+                    pgrx::datum::DatumWithOid::from(rule_display_name(rule).as_str()),
                     pgrx::datum::DatumWithOid::from(head_pred),
                     pgrx::datum::DatumWithOid::from(stratum_idx as i32),
                     pgrx::datum::DatumWithOid::from(stratum.is_recursive),
@@ -422,6 +495,20 @@ pub fn store_rules(rule_set: &str, rules: &[Rule]) -> i64 {
             count += 1;
         }
     }
+
+    // VAL-208 (v0.131.0): prune derivations of rules that no longer exist in
+    // this set (rule removed, or edited — an edit is a new identity).  Keeps
+    // UNIQUE (derived_sid, rule_name) meaningful: a fact re-derived by the
+    // current rules never accumulates rows under vanished rule names.
+    Spi::run_with_args(
+        "DELETE FROM _pg_ripple.derivations d \
+          WHERE d.rule_set = $1 \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM _pg_ripple.rules r \
+                 WHERE r.rule_set = d.rule_set AND r.name = d.rule_name)",
+        &[pgrx::datum::DatumWithOid::from(rule_set)],
+    )
+    .unwrap_or_else(|e| pgrx::error!("stale derivation prune error: {e}"));
 
     // M16-05 (v0.116.0): invalidate rule_explanations cache for this rule_set
     // by incrementing rule_version_stamp so stale explanation rows are rejected.
@@ -648,13 +735,23 @@ pub fn add_rule_to_set(rule_set_name: &str, rule_text: &str) -> Result<i64, Stri
         }
     });
 
+    // VAL-208: store the normalized rule text (annotations stripped) plus the
+    // stable name; re-adding a rule under an existing name refreshes its
+    // definition instead of silently accumulating duplicates.
     let new_rule_id: i64 = Spi::get_one_with_args::<i64>(
         "INSERT INTO _pg_ripple.rules \
-             (rule_set, rule_text, head_pred, stratum, is_recursive) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+             (rule_set, rule_text, name, head_pred, stratum, is_recursive) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (rule_set, name) DO UPDATE SET \
+                 rule_text = EXCLUDED.rule_text, \
+                 head_pred = EXCLUDED.head_pred, \
+                 stratum = EXCLUDED.stratum, \
+                 is_recursive = EXCLUDED.is_recursive \
+             RETURNING id",
         &[
             pgrx::datum::DatumWithOid::from(rule_set_name),
-            pgrx::datum::DatumWithOid::from(rule_text),
+            pgrx::datum::DatumWithOid::from(new_rule.rule_text.as_str()),
+            pgrx::datum::DatumWithOid::from(rule_display_name(new_rule).as_str()),
             pgrx::datum::DatumWithOid::from(head_pred),
             pgrx::datum::DatumWithOid::from(max_stratum),
             pgrx::datum::DatumWithOid::from(is_recursive),

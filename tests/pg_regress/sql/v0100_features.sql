@@ -67,11 +67,14 @@ SELECT count(*) >= 1 AS derivations_recorded
 FROM _pg_ripple.derivations
 WHERE rule_set = 'test_proof_tree';
 
--- The derivation row must reference the rule text.
+-- VAL-208 (v0.131.0): the derivation row references the rule by its stable
+-- name, which must resolve to a catalog rule whose text mentions the head.
 SELECT count(*) >= 1 AS derivation_has_rule_text
-FROM _pg_ripple.derivations
-WHERE rule_name LIKE '%ancestor%'
-  AND rule_set = 'test_proof_tree';
+FROM _pg_ripple.derivations d
+JOIN _pg_ripple.rules r
+  ON r.rule_set = d.rule_set AND r.name = d.rule_name
+WHERE d.rule_set = 'test_proof_tree'
+  AND r.rule_text LIKE '%ancestor%';
 
 -- ─── PROOF-TREE-05: justify() proof tree structure ───────────────────────────
 

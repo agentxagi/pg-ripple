@@ -1,0 +1,323 @@
+-- v0.131.0 regression tests (VAL-208): stable rule identity for derivations.
+--
+-- Covers:
+--   VAL208-NAMED-1: @name("label") becomes derivations.rule_name verbatim and
+--                   the catalog stores the clean rule text + the label
+--   VAL208-AUTO-1:  unnamed rules record 'auto:<md5-12>' — identical to the
+--                   fingerprint recomputed in SQL from rules.rule_text
+--                   (Rust <-> SQL parity)
+--   VAL208-EDIT-STABLE: editing a named rule (same @name) keeps one derivation
+--                   per fact; the identity survives the edit
+--   VAL208-EDIT-AUTO:  editing an unnamed rule prunes the vanished identity
+--                   and records the new one — no stale rows, no duplicates
+--   VAL208-JUSTIFY-1:  proof-tree nodes carry the resolved rule text (`rule`)
+--                   and the stable identity (`rule_name`)
+--   VAL208-DUP-ERR: duplicate @name labels in one load are rejected (PT0302)
+--   VAL208-COLLAPSE: identical duplicated rules collapse to one catalog row
+--
+-- Namespace: https://val208.test/
+SET client_min_messages = error;
+CREATE EXTENSION IF NOT EXISTS pg_ripple;
+SET search_path TO pg_ripple, public;
+-- Load so _PG_init registers GUCs (no shared_preload_libraries in tests).
+LOAD '$libdir/pg_ripple';
+SET client_min_messages = DEFAULT;
+SET pg_ripple.record_derivations = on;
+CREATE FUNCTION pg_temp.sid_of(subject TEXT, pred TEXT, object TEXT) RETURNS BIGINT AS $$
+DECLARE
+    p_id BIGINT; s_id BIGINT; o_id BIGINT; sid BIGINT;
+BEGIN
+    SELECT id INTO p_id FROM _pg_ripple.dictionary WHERE value = pred LIMIT 1;
+    SELECT id INTO s_id FROM _pg_ripple.dictionary WHERE value = subject LIMIT 1;
+    SELECT id INTO o_id FROM _pg_ripple.dictionary WHERE value = object LIMIT 1;
+    -- Derived facts live in the predicate's HTAP delta (VAL-207 canonical
+    -- storage); asserted rare facts live in vp_rare.
+    EXECUTE format(
+        'SELECT i FROM _pg_ripple.vp_%s_delta WHERE s = $1 AND o = $2 AND g = 0 LIMIT 1',
+        p_id) INTO sid USING s_id, o_id;
+    IF sid IS NULL THEN
+        SELECT i INTO sid FROM _pg_ripple.vp_rare
+        WHERE p = p_id AND s = s_id AND o = o_id LIMIT 1;
+    END IF;
+    RETURN sid;
+END $$ LANGUAGE plpgsql;
+-- Derivation count for a fact.
+CREATE FUNCTION pg_temp.deriv_count(subject TEXT, pred TEXT, object TEXT) RETURNS BIGINT AS $$
+    SELECT count(*) FROM _pg_ripple.derivations
+    WHERE derived_sid = pg_temp.sid_of(subject, pred, object)
+$$ LANGUAGE sql;
+-- Derivation name for a fact (single row expected).
+CREATE FUNCTION pg_temp.deriv_name(subject TEXT, pred TEXT, object TEXT) RETURNS TEXT AS $$
+    SELECT rule_name FROM _pg_ripple.derivations
+    WHERE derived_sid = pg_temp.sid_of(subject, pred, object)
+    ORDER BY rule_name LIMIT 1
+$$ LANGUAGE sql;
+-- ── VAL208-NAMED-1: explicit @name label ─────────────────────────────────────
+SELECT pg_ripple.drop_rules('v208_named') >= 0 AS named_ruleset_dropped;
+ named_ruleset_dropped 
+-----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val208.test/ancestor> ?z :- ?x <https://val208.test/parent> ?y, ?y <https://val208.test/parent> ?z @name("transitive") .',
+    'v208_named'
+) = 1 AS named_rule_loaded;
+ named_rule_loaded 
+-------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val208.test/A>', '<https://val208.test/parent>', '<https://val208.test/B>'
+) >= 1 AS parent_ab_inserted;
+ parent_ab_inserted 
+--------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val208.test/B>', '<https://val208.test/parent>', '<https://val208.test/C>'
+) >= 1 AS parent_bc_inserted;
+ parent_bc_inserted 
+--------------------
+ t
+(1 row)
+
+SELECT pg_ripple.infer('v208_named') >= 1 AS named_infer_derived;
+ named_infer_derived 
+---------------------
+ t
+(1 row)
+
+SELECT pg_temp.deriv_count(
+    'https://val208.test/A', 'https://val208.test/ancestor', 'https://val208.test/C') = 1
+    AS val208_named1_single_derivation;
+ val208_named1_single_derivation 
+---------------------------------
+ t
+(1 row)
+
+SELECT pg_temp.deriv_name(
+    'https://val208.test/A', 'https://val208.test/ancestor', 'https://val208.test/C') = 'transitive'
+    AS val208_named1_label_recorded;
+ val208_named1_label_recorded 
+------------------------------
+ t
+(1 row)
+
+-- The catalog stores the clean rule text (annotation stripped) + the label.
+SELECT rule_text = '?x <https://val208.test/ancestor> ?z :- ?x <https://val208.test/parent> ?y, ?y <https://val208.test/parent> ?z .'
+    AND name = 'transitive'
+    AS val208_named1_catalog_row
+FROM _pg_ripple.rules WHERE rule_set = 'v208_named';
+ val208_named1_catalog_row 
+---------------------------
+ t
+(1 row)
+
+-- ── VAL208-AUTO-1: auto fingerprint, Rust <-> SQL parity ────────────────────
+SELECT pg_ripple.drop_rules('v208_auto') >= 0 AS auto_ruleset_dropped;
+ auto_ruleset_dropped 
+----------------------
+ t
+(1 row)
+
+SELECT pg_ripple.load_rules(
+    '?x <https://val208.test/reach> ?y :- ?x <https://val208.test/link> ?y .',
+    'v208_auto'
+) = 1 AS auto_rule_loaded;
+ auto_rule_loaded 
+------------------
+ t
+(1 row)
+
+SELECT pg_ripple.insert_triple(
+    '<https://val208.test/N1>', '<https://val208.test/link>', '<https://val208.test/N2>'
+) >= 1 AS link_inserted;
+ link_inserted 
+---------------
+ t
+(1 row)
+
+SELECT pg_ripple.infer('v208_auto') >= 1 AS auto_infer_derived;
+ auto_infer_derived 
+--------------------
+ t
+(1 row)
+
+SELECT (SELECT d.rule_name FROM _pg_ripple.derivations d WHERE d.rule_set = 'v208_auto')
+     = (SELECT 'auto:' || left(md5(r.rule_text), 12)
+        FROM _pg_ripple.rules r WHERE r.rule_set = 'v208_auto')
+   AND (SELECT name FROM _pg_ripple.rules WHERE rule_set = 'v208_auto')
+     = (SELECT d.rule_name FROM _pg_ripple.derivations d WHERE d.rule_set = 'v208_auto')
+    AS val208_auto1_fingerprint_parity;
+ val208_auto1_fingerprint_parity 
+---------------------------------
+ t
+(1 row)
+
+-- ── VAL208-EDIT-STABLE: edited named rule keeps one derivation per fact ──────
+SELECT pg_ripple.load_rules(
+    '?x <https://val208.test/ancestor> ?w :- ?x <https://val208.test/parent> ?y, ?y <https://val208.test/parent> ?w @name("transitive") .',
+    'v208_named'
+) = 1 AS named_rule_reloaded_after_edit;
+ named_rule_reloaded_after_edit 
+--------------------------------
+ t
+(1 row)
+
+-- The already-derived fact keeps exactly one row (identity survived the edit).
+SELECT pg_temp.deriv_count(
+    'https://val208.test/A', 'https://val208.test/ancestor', 'https://val208.test/C') = 1
+    AS val208_edit_stable_no_duplicate;
+ val208_edit_stable_no_duplicate 
+---------------------------------
+ t
+(1 row)
+
+-- A fact derived after the edit lands under the same identity.
+SELECT pg_ripple.insert_triple(
+    '<https://val208.test/C>', '<https://val208.test/parent>', '<https://val208.test/D>'
+) >= 1 AS parent_cd_inserted;
+ parent_cd_inserted 
+--------------------
+ t
+(1 row)
+
+SELECT pg_ripple.infer('v208_named') >= 1 AS named_infer_again;
+ named_infer_again 
+-------------------
+ t
+(1 row)
+
+SELECT pg_temp.deriv_count(
+    'https://val208.test/B', 'https://val208.test/ancestor', 'https://val208.test/D') = 1
+   AND pg_temp.deriv_name(
+    'https://val208.test/B', 'https://val208.test/ancestor', 'https://val208.test/D') = 'transitive'
+    AS val208_edit_stable_identity_survives;
+ val208_edit_stable_identity_survives 
+--------------------------------------
+ t
+(1 row)
+
+-- ── VAL208-EDIT-AUTO: edited unnamed rule prunes the vanished identity ───────
+SELECT pg_ripple.load_rules(
+    '?x <https://val208.test/reach> ?z :- ?x <https://val208.test/link> ?z .',
+    'v208_auto'
+) = 1 AS auto_rule_reloaded_after_edit;
+ auto_rule_reloaded_after_edit 
+-------------------------------
+ t
+(1 row)
+
+-- The old fingerprint is gone from the set's derivations.
+SELECT count(*) = 0 AS val208_edit_auto_stale_pruned
+FROM _pg_ripple.derivations
+WHERE rule_set = 'v208_auto'
+  AND rule_name <> (SELECT name FROM _pg_ripple.rules WHERE rule_set = 'v208_auto');
+ val208_edit_auto_stale_pruned 
+-------------------------------
+ t
+(1 row)
+
+-- The old fact's derivation no longer exists (its identity vanished).
+SELECT pg_temp.deriv_count(
+    'https://val208.test/N1', 'https://val208.test/reach', 'https://val208.test/N2') = 0
+    AS val208_edit_auto_old_row_pruned;
+ val208_edit_auto_old_row_pruned 
+---------------------------------
+ t
+(1 row)
+
+-- A fact derived by the edited rule records the new identity — one row.
+SELECT pg_ripple.insert_triple(
+    '<https://val208.test/N2>', '<https://val208.test/link>', '<https://val208.test/N3>'
+) >= 1 AS link2_inserted;
+ link2_inserted 
+----------------
+ t
+(1 row)
+
+SELECT pg_ripple.infer('v208_auto') >= 1 AS auto_infer_again;
+ auto_infer_again 
+------------------
+ t
+(1 row)
+
+SELECT pg_temp.deriv_count(
+    'https://val208.test/N2', 'https://val208.test/reach', 'https://val208.test/N3') = 1
+   AND pg_temp.deriv_name(
+    'https://val208.test/N2', 'https://val208.test/reach', 'https://val208.test/N3')
+     = (SELECT 'auto:' || left(md5(rule_text), 12)
+        FROM _pg_ripple.rules WHERE rule_set = 'v208_auto')
+    AS val208_edit_auto_new_identity;
+ val208_edit_auto_new_identity 
+-------------------------------
+ t
+(1 row)
+
+-- ── VAL208-JUSTIFY-1: proof tree resolves text and exposes the identity ─────
+SELECT (pg_ripple.justify(
+    'https://val208.test/A',
+    'https://val208.test/ancestor',
+    'https://val208.test/C')::jsonb -> 'derivations' -> 0 ->> 'rule_name') = 'transitive'
+    AS val208_justify1_identity;
+ val208_justify1_identity 
+--------------------------
+ t
+(1 row)
+
+SELECT (pg_ripple.justify(
+    'https://val208.test/A',
+    'https://val208.test/ancestor',
+    'https://val208.test/C')::jsonb -> 'derivations' -> 0 ->> 'rule')
+    = '?x <https://val208.test/ancestor> ?w :- ?x <https://val208.test/parent> ?y, ?y <https://val208.test/parent> ?w .'
+    AS val208_justify1_rule_text_resolved;
+ val208_justify1_rule_text_resolved 
+------------------------------------
+ t
+(1 row)
+
+-- ── VAL208-DUP-ERR: duplicate @name labels rejected (PT0302) ────────────────
+CREATE TABLE pg_temp.err_captured(msg TEXT);
+DO $$
+BEGIN
+    BEGIN
+        PERFORM pg_ripple.load_rules(
+            '?x <https://val208.test/a> ?y :- ?x <https://val208.test/b> ?y @name("dup") . ?x <https://val208.test/c> ?y :- ?x <https://val208.test/b> ?y @name("dup") .',
+            'v208_dup');
+        INSERT INTO pg_temp.err_captured VALUES ('load_rules succeeded — expected PT0302');
+    EXCEPTION WHEN OTHERS THEN
+        INSERT INTO pg_temp.err_captured VALUES (SQLERRM);
+    END;
+END $$;
+SELECT msg LIKE '%PT0302%' AS val208_dup_err_rejected FROM pg_temp.err_captured;
+ val208_dup_err_rejected 
+-------------------------
+ t
+(1 row)
+
+-- ── VAL208-COLLAPSE: identical duplicated rules collapse to one row ─────────
+SELECT pg_ripple.load_rules(
+    '?x <https://val208.test/e> ?y :- ?x <https://val208.test/f> ?y . ?x <https://val208.test/e> ?y :- ?x <https://val208.test/f> ?y .',
+    'v208_collapse') = 2 AS collapse_load_reports_both_attempts;
+ collapse_load_reports_both_attempts 
+-------------------------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS val208_collapse_one_catalog_row
+FROM _pg_ripple.rules WHERE rule_set = 'v208_collapse';
+ val208_collapse_one_catalog_row 
+---------------------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS val208_collapse_one_name
+FROM (SELECT DISTINCT name FROM _pg_ripple.rules WHERE rule_set = 'v208_collapse') n;
+ val208_collapse_one_name 
+--------------------------
+ t
+(1 row)
+

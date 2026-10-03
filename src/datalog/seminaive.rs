@@ -13,8 +13,9 @@
 use pgrx::prelude::*;
 
 use super::{
-    BodyLiteral, Rule, Term, check_subsumption, compile_rule_delta_variants_to, compile_rule_set,
-    compile_single_rule_to, has_variable_pred, parse_rules, vp_read_expr_pub,
+    BodyLiteral, Rule, Term, attach_catalog_name, check_subsumption,
+    compile_rule_delta_variants_to, compile_rule_set, compile_single_rule_to, has_variable_pred,
+    parse_rules, vp_read_expr_pub,
 };
 
 /// Materialise this run's derived rows for `pred_id` from `delta_table` (an
@@ -103,8 +104,10 @@ pub fn run_inference_seminaive(rule_set_name: &str) -> (i64, i32) {
         });
     }
 
-    let rule_rows: Vec<(String, i32, bool)> = {
-        let sql = "SELECT rule_text, stratum, is_recursive \
+    let rule_rows: Vec<(String, i32, bool, Option<String>)> = {
+        // VAL-208: carry the catalog rule name (annotation-free text loses
+        // the @name label on reparse).
+        let sql = "SELECT rule_text, stratum, is_recursive, name \
                    FROM _pg_ripple.rules \
                    WHERE rule_set = $1 AND active = true \
                    ORDER BY stratum, id";
@@ -116,7 +119,8 @@ pub fn run_inference_seminaive(rule_set_name: &str) -> (i64, i32) {
                     let text: String = row.get::<String>(1).ok().flatten().unwrap_or_default();
                     let stratum: i32 = row.get::<i32>(2).ok().flatten().unwrap_or(0);
                     let recursive: bool = row.get::<bool>(3).ok().flatten().unwrap_or(false);
-                    (text, stratum, recursive)
+                    let name: Option<String> = row.get::<String>(4).ok().flatten();
+                    (text, stratum, recursive, name)
                 })
                 .collect::<Vec<_>>()
         })
@@ -127,9 +131,12 @@ pub fn run_inference_seminaive(rule_set_name: &str) -> (i64, i32) {
     }
 
     let mut all_rules: Vec<Rule> = Vec::new();
-    for (rule_text, _stratum, _recursive) in &rule_rows {
+    for (rule_text, _stratum, _recursive, catalog_name) in &rule_rows {
         match parse_rules(rule_text, rule_set_name) {
-            Ok(rs) => all_rules.extend(rs.rules),
+            Ok(mut rs) => {
+                attach_catalog_name(&mut rs.rules, catalog_name.as_deref());
+                all_rules.extend(rs.rules);
+            }
             Err(e) => pgrx::warning!("rule parse error during semi-naive inference: {e}"),
         }
     }
@@ -434,8 +441,10 @@ pub fn run_inference_seminaive(rule_set_name: &str) -> (i64, i32) {
 pub fn run_inference_seminaive_full(rule_set_name: &str) -> (i64, i32, Vec<String>, usize, usize) {
     super::ensure_catalog();
 
-    let rule_rows: Vec<(String, i32, bool)> = {
-        let sql = "SELECT rule_text, stratum, is_recursive \
+    let rule_rows: Vec<(String, i32, bool, Option<String>)> = {
+        // VAL-208: carry the catalog rule name (annotation-free text loses
+        // the @name label on reparse).
+        let sql = "SELECT rule_text, stratum, is_recursive, name \
                    FROM _pg_ripple.rules \
                    WHERE rule_set = $1 AND active = true \
                    ORDER BY stratum, id";
@@ -447,7 +456,8 @@ pub fn run_inference_seminaive_full(rule_set_name: &str) -> (i64, i32, Vec<Strin
                     let text: String = row.get::<String>(1).ok().flatten().unwrap_or_default();
                     let stratum: i32 = row.get::<i32>(2).ok().flatten().unwrap_or(0);
                     let recursive: bool = row.get::<bool>(3).ok().flatten().unwrap_or(false);
-                    (text, stratum, recursive)
+                    let name: Option<String> = row.get::<String>(4).ok().flatten();
+                    (text, stratum, recursive, name)
                 })
                 .collect::<Vec<_>>()
         })
@@ -458,9 +468,12 @@ pub fn run_inference_seminaive_full(rule_set_name: &str) -> (i64, i32, Vec<Strin
     }
 
     let mut all_rules: Vec<Rule> = Vec::new();
-    for (rule_text, _stratum, _recursive) in &rule_rows {
+    for (rule_text, _stratum, _recursive, catalog_name) in &rule_rows {
         match parse_rules(rule_text, rule_set_name) {
-            Ok(rs) => all_rules.extend(rs.rules),
+            Ok(mut rs) => {
+                attach_catalog_name(&mut rs.rules, catalog_name.as_deref());
+                all_rules.extend(rs.rules);
+            }
             Err(e) => pgrx::warning!("rule parse error during full semi-naive inference: {e}"),
         }
     }
@@ -481,7 +494,7 @@ pub fn run_inference_seminaive_full(rule_set_name: &str) -> (i64, i32, Vec<Strin
 pub fn run_inference(rule_set_name: &str) -> i64 {
     super::ensure_catalog();
 
-    let rules_sql = "SELECT rule_text, stratum, is_recursive \
+    let rules_sql = "SELECT rule_text, stratum, is_recursive, name \
                      FROM _pg_ripple.rules \
                      WHERE rule_set = $1 AND active = true \
                      ORDER BY stratum, id";
@@ -498,7 +511,8 @@ pub fn run_inference(rule_set_name: &str) -> i64 {
                 let text: String = row.get::<String>(1).ok().flatten().unwrap_or_default();
                 let stratum: i32 = row.get::<i32>(2).ok().flatten().unwrap_or(0);
                 let recursive: bool = row.get::<bool>(3).ok().flatten().unwrap_or(false);
-                (text, stratum, recursive)
+                let name: Option<String> = row.get::<String>(4).ok().flatten();
+                (text, stratum, recursive, name)
             })
             .collect::<Vec<_>>()
     });
@@ -510,9 +524,12 @@ pub fn run_inference(rule_set_name: &str) -> i64 {
     // Parse all rules upfront so provenance recording can attribute each
     // derived fact to its rule after the SQL batch executes (VAL-207).
     let mut all_rules: Vec<Rule> = Vec::new();
-    for (rule_text, _stratum, _recursive) in &rule_rows {
+    for (rule_text, _stratum, _recursive, catalog_name) in &rule_rows {
         match parse_rules(rule_text, rule_set_name) {
-            Ok(rs) => all_rules.extend(rs.rules),
+            Ok(mut rs) => {
+                attach_catalog_name(&mut rs.rules, catalog_name.as_deref());
+                all_rules.extend(rs.rules);
+            }
             Err(e) => pgrx::warning!("rule parse error during inference: {e}"),
         }
     }
@@ -666,6 +683,7 @@ fn substitute_pred_var(rule: &Rule, var_name: &str, pred_id: i64) -> Rule {
         head: new_head,
         body: new_body,
         rule_text: format!("/* {var_name}={pred_id} */ {}", rule.rule_text),
+        name: rule.name.clone(),
         weight: rule.weight,
     }
 }

@@ -2092,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "pg_ripple"
-version = "0.130.0"
+version = "0.131.0"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -2100,6 +2100,7 @@ dependencies = [
  "hmac",
  "libc",
  "lru",
+ "md-5 0.10.6",
  "oxigraph",
  "oxrdf",
  "parquet",
