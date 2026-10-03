@@ -10,25 +10,22 @@
 unmaintained = "none"
 yanked = "deny"
 
-# Pre-existing advisories not introduced by pg_ripple — triaged and tracked.
-# Review before each release to ensure no new vulnerabilities are silently ignored.
+# Triaged advisories. Kept in sync with .cargo/audit.toml (VAL-348): every
+# fixable advisory was cleared by dependency bumps (h2, postgres-protocol,
+# tokio-postgres, quinn-proto, rustls, rustls-webpki, anyhow, lru, and
+# parquet 60 / arrow 60 which drops paste). What remains has no fixed
+# upstream release. Review before each release; remove on upstream fix.
+# Note: serde_cbor (RUSTSEC-2021-0127) is NOT listed here — unmaintained =
+# "none" above, so cargo-deny never flags it (listing it triggers an
+# advisory-not-detected warning); its live suppression is in
+# .cargo/audit.toml, which runs cargo audit --deny unmaintained.
 ignore = [
-    # RUSTSEC-2026-0104: pre-existing transitive dependency advisory
-    { id = "RUSTSEC-2026-0104", reason = "pre-existing transitive dependency; tracked for upstream fix" },
-    # RUSTSEC-2024-0436: pre-existing unmaintained crate warning
-    { id = "RUSTSEC-2024-0436", reason = "pre-existing unmaintained transitive dependency; tracked for replacement" },
-    # RUSTSEC-2021-0127: pre-existing advisory
-    { id = "RUSTSEC-2021-0127", reason = "pre-existing transitive dependency advisory; tracked for upstream fix" },
-    # Below: surfaced by the first-ever CI runs (PR #9, 2026-10-03) — all in the
-    # pre-existing dependency tree, none introduced by pg_ripple code. Tracked in
-    # the Valor Digital ops backlog (VAL-348); review before each release.
-    { id = "RUSTSEC-2026-0178", reason = "pre-existing transitive dependency advisory; tracked in VAL-348" },
-    { id = "RUSTSEC-2026-0179", reason = "pre-existing transitive dependency advisory (SCRAM DoS); tracked in VAL-348" },
-    { id = "RUSTSEC-2026-0180", reason = "pre-existing transitive dependency advisory (hstore DoS); tracked in VAL-348" },
-    { id = "RUSTSEC-2026-0194", reason = "pre-existing transitive dependency advisory (quadratic parse); tracked in VAL-348" },
-    { id = "RUSTSEC-2026-0195", reason = "pre-existing transitive dependency advisory (ns allocation DoS); tracked in VAL-348" },
-    { id = "RUSTSEC-2026-0253", reason = "pre-existing transitive dependency advisory (LruCache UAF); tracked in VAL-348" },
-    { id = "RUSTSEC-2026-0285", reason = "pre-existing transitive dependency advisory; tracked in VAL-348" },
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml <0.41 DoS advisories.
+    # Pinned by rio_xml 0.8.6 (^0.36) and sparesults 0.3.4 / oxrdfxml 0.2.4
+    # (^0.37) — latest upstream releases; none accepts quick-xml >=0.41.
+    # Exposure limited to RDF/XML ingestion paths.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml pinned <0.41 by rio_xml 0.8.6 / sparesults 0.3.4 / oxrdfxml 0.2.4 (latest upstream releases); tracked in VAL-348" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml pinned <0.41 by rio_xml 0.8.6 / sparesults 0.3.4 / oxrdfxml 0.2.4 (latest upstream releases); tracked in VAL-348" },
 ]
 
 [licenses]

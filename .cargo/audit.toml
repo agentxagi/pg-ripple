@@ -1,23 +1,41 @@
 # cargo-audit configuration — triaged advisory ignores.
 #
-# All IDs below were surfaced by the first-ever CI runs of this repo
-# (PR #9, 2026-10-03) and live in the PRE-EXISTING dependency tree — none
-# were introduced by pg_ripple code. The real fix (dependency bumps) is
-# tracked as debt in the Valor Digital ops backlog (VAL-348).
-# Same triage as deny.toml ([advisories].ignore); review before each release.
+# This is the ONLY audit config cargo audit reads from the repo root
+# (.cargo/audit.toml); the former root-level audit.toml was dead config for CI
+# (never parsed — its table entries are rejected by cargo-audit 0.22+) and was
+# removed to stop the two-file drift (VAL-348).
+#
+# Advisory Lifecycle Policy (M16-21 v0.116.0):
+# Open advisory → triage (assess exploitability in the pg_ripple use-case) →
+# ignore with an explicit expiry date (maximum 12 months) if not fixable →
+# quarterly review (re-examine on expiry; update reasoning or remove) →
+# expiry forces re-decision: either extend with fresh rationale, fix upstream
+# dependency, or treat as a blocker.  No advisory may be silently suppressed
+# without a reason comment and an expiry note (cargo-audit 0.22 only accepts
+# bare IDs here, so reason/expiry live in the comment block per entry).
+#
+# VAL-348 (2026-10-03): the first-CI-run baseline of 13 bare IDs was replaced
+# by real dependency bumps — h2 0.4.19, postgres-protocol 0.6.12,
+# tokio-postgres 0.7.18, quinn-proto 0.11.19, rustls 0.23.45,
+# rustls-webpki 0.103.15, anyhow 1.0.104, lru 0.18.5, and parquet 60 /
+# arrow 60 (drops the unmaintained paste proc-macro). Only advisories with NO
+# fixed upstream release remain below.
 [advisories]
 ignore = [
+    # RUSTSEC-2021-0127 — serde_cbor 0.11.2 is unmaintained; transitive dep of
+    # pgrx 0.18.0 (pinned exact). No upgrade path until pgrx drops serde_cbor;
+    # pg_ripple does not use it directly.
+    # Expiry: 2027-01-01 — re-audit on the next pgrx upgrade.
     "RUSTSEC-2021-0127",
-    "RUSTSEC-2024-0436",
-    "RUSTSEC-2026-0104",
-    "RUSTSEC-2026-0178",
-    "RUSTSEC-2026-0179",
-    "RUSTSEC-2026-0180",
-    "RUSTSEC-2026-0185",
-    "RUSTSEC-2026-0190",
+    # RUSTSEC-2026-0194 — quick-xml <0.41 quadratic duplicate-attribute parse
+    # (CPU DoS). Two copies in the tree: 0.36 via rio_xml 0.8.6 (^0.36, latest
+    # release) and 0.37 via sparesults 0.3.4 / oxrdfxml 0.2.4 (^0.37, latest
+    # releases). No upstream release of the RDF crates accepts quick-xml
+    # >=0.41; exposure limited to RDF/XML ingestion paths.
+    # Expiry: 2027-01-01 — remove when rio_xml/sparesults release a fix.
     "RUSTSEC-2026-0194",
+    # RUSTSEC-2026-0195 — quick-xml <0.41 unbounded namespace-declaration
+    # allocation (memory DoS); same upstream pinning as RUSTSEC-2026-0194.
+    # Expiry: 2027-01-01 — remove when rio_xml/sparesults release a fix.
     "RUSTSEC-2026-0195",
-    "RUSTSEC-2026-0253",
-    "RUSTSEC-2026-0258",
-    "RUSTSEC-2026-0285",
 ]
