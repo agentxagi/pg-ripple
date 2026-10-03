@@ -30,7 +30,7 @@ BEGIN
         '<http://sub.test/a>', '<http://sub.test/p>', '"internado-e-desfeito"');
     RAISE EXCEPTION 'desfaz';
 EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'subtransacao_desfeita';
+    RAISE WARNING 'subtransacao_desfeita';
 END $$;
 
 SELECT count(*) AS linha_no_dicionario

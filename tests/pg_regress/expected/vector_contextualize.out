@@ -4,6 +4,11 @@ SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_ripple;
 SET client_min_messages = DEFAULT;
 SET search_path TO pg_ripple, public;
+-- Every parallel worker process loads the C library and emits the
+-- not-preloaded WARNING to the client; on a suite-warmed database the DELETE
+-- below plans a parallel scan and the warning count varies with the workers
+-- actually launched. Pin serial plans so the compared output is deterministic.
+SET max_parallel_workers_per_gather = 0;
 -- Load test data with rich neighborhood.
 SELECT pg_ripple.load_ntriples(
     '<https://pharma.example/aspirin>   <http://www.w3.org/2000/01/rdf-schema#label> "aspirin" .' || chr(10) ||
