@@ -666,7 +666,10 @@ fn match_term(p: &CTerm, t: &CTerm, subst: &mut HashMap<usize, CTerm>) -> bool {
 /// Match a whole atom; on failure, roll back any bindings made.
 fn match_atom(p: &CAtom, t: &CAtom, subst: &mut HashMap<usize, CTerm>) -> bool {
     let saved = subst.clone();
-    if p.iter().zip(t.iter()).all(|(pt, tt)| match_term(pt, tt, subst)) {
+    if p.iter()
+        .zip(t.iter())
+        .all(|(pt, tt)| match_term(pt, tt, subst))
+    {
         true
     } else {
         *subst = saved;
@@ -885,6 +888,7 @@ mod tests {
                 })
             }],
             rule_text: String::new(),
+            name: None,
             weight: None,
         }
     }
@@ -950,6 +954,7 @@ mod tests {
             head: Some(head),
             body,
             rule_text: text.to_owned(),
+            name: None,
             weight,
         }
     }
@@ -1107,6 +1112,7 @@ mod tests {
                     }),
                 ],
                 rule_text: "r2".to_owned(),
+                name: None,
                 weight: None,
             },
         ];
@@ -1141,6 +1147,9 @@ mod tests {
             "r2",
             None,
         );
-        assert_eq!(check_subsumption(&[general, specific]), Vec::<String>::new());
+        assert_eq!(
+            check_subsumption(&[general, specific]),
+            Vec::<String>::new()
+        );
     }
 }

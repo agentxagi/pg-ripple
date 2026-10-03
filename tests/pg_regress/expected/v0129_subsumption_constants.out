@@ -164,12 +164,21 @@ SELECT pg_ripple.insert_triple(
 
 CREATE TEMP TABLE _sub_dup_stats AS
     SELECT pg_ripple.infer_with_stats('sub_dup') AS stats;
--- The duplicate is reported exactly once (one copy eliminated).
-SELECT jsonb_array_length(stats -> 'eliminated_rules') = 1
-    AS sub_dup_one_copy_eliminated
+-- VAL-208 (v0.131.0): identical duplicates collapse to one catalog row at
+-- store time (ON CONFLICT (rule_set, name) DO NOTHING) — the fixpoint never
+-- sees the duplicate, so subsumption has nothing to eliminate here.
+SELECT count(*) = 1 AS sub_dup_one_catalog_row
+FROM _pg_ripple.rules WHERE rule_set = 'sub_dup';
+ sub_dup_one_catalog_row 
+-------------------------
+ t
+(1 row)
+
+SELECT jsonb_array_length(stats -> 'eliminated_rules') = 0
+    AS sub_dup_nothing_to_eliminate
 FROM _sub_dup_stats;
- sub_dup_one_copy_eliminated 
------------------------------
+ sub_dup_nothing_to_eliminate 
+------------------------------
  t
 (1 row)
 

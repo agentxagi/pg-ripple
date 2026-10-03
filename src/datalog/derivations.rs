@@ -4,7 +4,9 @@
 //! records, for every newly derived fact:
 //!
 //! - `derived_sid`     — the statement ID of the inferred triple
-//! - `rule_name`       — the Datalog rule text that produced it
+//! - `rule_name`       — the rule's stable identity (explicit `@name("label")`
+//!   or an auto fingerprint of the rule text, VAL-208); display surfaces
+//!   resolve the current text through `_pg_ripple.rules`
 //! - `rule_set`        — the rule set name
 //! - `antecedent_sids` — SIDs of the body-atom triples that fired the rule
 //!
@@ -60,9 +62,12 @@ where
     let Some(targets) = targets_fn(head_pred) else {
         return;
     };
-    let Some(sql) =
-        compile_antecedent_insert_with_targets(rule, rule_set, &targets.delta_table, &targets.sid_source)
-    else {
+    let Some(sql) = compile_antecedent_insert_with_targets(
+        rule,
+        rule_set,
+        &targets.delta_table,
+        &targets.sid_source,
+    ) else {
         return;
     };
     if let Err(e) = Spi::run_with_args(&sql, &[]) {
@@ -143,10 +148,7 @@ fn compile_antecedent_insert_with_targets(
             _ => return None,
         };
         let alias = format!("b{idx}");
-        let table_expr = format!(
-            "{} AS {alias}",
-            super::compiler::vp_sid_read_expr(pred_id)
-        );
+        let table_expr = format!("{} AS {alias}", super::compiler::vp_sid_read_expr(pred_id));
         bid_columns.push(format!("{alias}.i"));
 
         let mut join_conds: Vec<String> = Vec::new();
@@ -223,7 +225,9 @@ fn compile_antecedent_insert_with_targets(
         format!("ARRAY[{}]::BIGINT[]", bid_columns.join(", "))
     };
 
-    let rule_name_esc = rule.rule_text.replace('\'', "''");
+    // VAL-208 (v0.131.0): derivations store the rule's stable identity (the
+    // explicit @name label or the auto fingerprint), not the full rule text.
+    let rule_name_esc = super::rule_display_name(rule).replace('\'', "''");
     let rule_set_esc = rule_set.replace('\'', "''");
 
     // Join this run's delta rows against the canonical storage to get SIDs
@@ -260,7 +264,8 @@ fn record_recursive_rule_stub(
 ) -> Option<String> {
     rule.head.as_ref()?;
 
-    let rule_name_esc = rule.rule_text.replace('\'', "''");
+    // VAL-208 (v0.131.0): stable rule identity, as above.
+    let rule_name_esc = super::rule_display_name(rule).replace('\'', "''");
     let rule_set_esc = rule_set.replace('\'', "''");
 
     let sql = format!(
@@ -458,6 +463,25 @@ fn derivations_for_sid(sid: i64) -> Vec<(String, String, Vec<i64>)> {
     })
 }
 
+/// Resolve the current rule text for a derivation's `(rule_set, rule_name)`.
+///
+/// VAL-208: `rule_name` is a stable identity, not the rule text; display
+/// surfaces (justify proof trees, runtime conflict reports) resolve the text
+/// through the rules catalog.  Returns `None` when the rule no longer exists
+/// (removed or edited away) — callers fall back to the raw name.
+pub(crate) fn resolve_rule_text(rule_set: &str, rule_name: &str) -> Option<String> {
+    Spi::get_one_with_args::<String>(
+        "SELECT rule_text FROM _pg_ripple.rules \
+          WHERE rule_set = $1 AND name = $2 LIMIT 1",
+        &[
+            pgrx::datum::DatumWithOid::from(rule_set),
+            pgrx::datum::DatumWithOid::from(rule_name),
+        ],
+    )
+    .ok()
+    .flatten()
+}
+
 /// Get the triple `(p, s, o)` for a given SID from vp_rare.
 ///
 /// VAL-207: delegates to the cross-storage [`triple_ids_for_sid`] — with
@@ -554,8 +578,13 @@ fn build_proof_tree(
                 max_nodes,
             ));
         }
+        // VAL-208: `rule` keeps the resolved rule text (what the reader
+        // wants); `rule_name` is the stable identity derivations store.
+        let rule_display =
+            resolve_rule_text(rule_set, rule_name).unwrap_or_else(|| rule_name.clone());
         rules_json.push(serde_json::json!({
-            "rule": rule_name,
+            "rule": rule_display,
+            "rule_name": rule_name,
             "rule_set": rule_set,
             "antecedents": antecedents_json
         }));
@@ -633,9 +662,7 @@ fn sid_for_triple_in_graph(p_id: i64, s_id: i64, o_id: i64, g_id: i64) -> Option
 
     let table = crate::storage::vp_rare_io::get_dedicated_vp_table(p_id)?;
     Spi::get_one_with_args::<i64>(
-        &format!(
-            "SELECT i FROM {table} WHERE s = $1 AND o = $2 AND g = $3 ORDER BY i LIMIT 1"
-        ),
+        &format!("SELECT i FROM {table} WHERE s = $1 AND o = $2 AND g = $3 ORDER BY i LIMIT 1"),
         &[
             DatumWithOid::from(s_id),
             DatumWithOid::from(o_id),
@@ -652,15 +679,17 @@ fn predicate_candidates_for_sid(sid: i64) -> Vec<i64> {
 
     // Fast path: range mapping catalog.
     let from_catalog: Vec<i64> = Spi::connect(|c| {
-        Ok::<Vec<i64>, pgrx::spi::SpiError>(c.select(
-            "SELECT predicate_id FROM _pg_ripple.statements \
+        Ok::<Vec<i64>, pgrx::spi::SpiError>(
+            c.select(
+                "SELECT predicate_id FROM _pg_ripple.statements \
              WHERE sid_min <= $1 AND sid_max >= $1 \
              ORDER BY sid_min DESC",
-            None,
-            &[DatumWithOid::from(sid)],
-        )?
-        .filter_map(|row| row.get::<i64>(1).ok().flatten())
-        .collect())
+                None,
+                &[DatumWithOid::from(sid)],
+            )?
+            .filter_map(|row| row.get::<i64>(1).ok().flatten())
+            .collect(),
+        )
     })
     .unwrap_or_default();
     for id in from_catalog {
@@ -672,13 +701,15 @@ fn predicate_candidates_for_sid(sid: i64) -> Vec<i64> {
     // Fallback: every promoted predicate (catalog row may lag for edge cases;
     // mirrors get_statement_by_sid's fallback).
     let all_promoted: Vec<i64> = Spi::connect(|c| {
-        Ok::<Vec<i64>, pgrx::spi::SpiError>(c.select(
-            "SELECT id FROM _pg_ripple.predicates WHERE table_oid IS NOT NULL",
-            None,
-            &[],
-        )?
-        .filter_map(|row| row.get::<i64>(1).ok().flatten())
-        .collect())
+        Ok::<Vec<i64>, pgrx::spi::SpiError>(
+            c.select(
+                "SELECT id FROM _pg_ripple.predicates WHERE table_oid IS NOT NULL",
+                None,
+                &[],
+            )?
+            .filter_map(|row| row.get::<i64>(1).ok().flatten())
+            .collect(),
+        )
     })
     .unwrap_or_default();
     for id in all_promoted {
@@ -878,8 +909,13 @@ fn build_proof_tree_graph(
             }
         }
         if complete {
+            // VAL-208: resolved text + stable identity, as in the graph-blind
+            // builder above.
+            let rule_display =
+                resolve_rule_text(rule_set, rule_name).unwrap_or_else(|| rule_name.clone());
             rules_json.push(serde_json::json!({
-                "rule": rule_name,
+                "rule": rule_display,
+                "rule_name": rule_name,
                 "rule_set": rule_set,
                 "antecedents": antecedents_json
             }));
@@ -929,5 +965,13 @@ pub fn justify_in_graph_impl(
     let max_nodes = crate::gucs::datalog::PROOF_TREE_MAX_NODES.get().max(10) as u32;
     let mut visited = std::collections::HashSet::new();
     let mut node_count: u32 = 0;
-    build_proof_tree_graph(sid, g_id, &mut visited, 0, &mut node_count, max_depth, max_nodes)
+    build_proof_tree_graph(
+        sid,
+        g_id,
+        &mut visited,
+        0,
+        &mut node_count,
+        max_depth,
+        max_nodes,
+    )
 }

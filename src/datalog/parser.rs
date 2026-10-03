@@ -51,6 +51,19 @@ pub fn parse_rules(text: &str, rule_set_name: &str) -> Result<RuleSet, String> {
         return Err(errors.join("; "));
     }
 
+    // VAL-208 (PT0302): explicit @name labels must be unique within one load —
+    // two different rules claiming the same label would collapse their
+    // derivations into a single identity.
+    let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for rule in &rules {
+        if let Some(label) = &rule.name
+            && !named.insert(label.clone())
+        {
+            return Err(format!(
+                "duplicate @name \"{label}\" in rule set \"{rule_set_name}\" (PT0302)"
+            ));
+        }
+    }
     Ok(RuleSet {
         name: rule_set_name.to_owned(),
         rules,
@@ -111,8 +124,10 @@ fn tokenize_rules(text: &str) -> Vec<String> {
 
 /// Parse a single rule (without the trailing `.`).
 fn parse_rule(text: &str) -> Result<Rule, String> {
-    // v0.87.0: extract @weight(FLOAT) annotation before parsing rule body.
-    let (rule_body, weight) = extract_weight_annotation(text);
+    // v0.87.0: @weight(FLOAT); v0.131.0 (VAL-208): @name("label"). Both
+    // annotations are stripped before the rule text is captured, so the stored
+    // `rule_text` stays a clean Datalog rule.
+    let (rule_body, weight, name) = extract_annotations(text);
     let rule_text = rule_body.trim().to_owned() + " .";
 
     // Constraint rule: starts with ':-'
@@ -124,6 +139,7 @@ fn parse_rule(text: &str) -> Result<Rule, String> {
             body,
             rule_text,
             weight,
+            name,
         });
     }
 
@@ -140,7 +156,22 @@ fn parse_rule(text: &str) -> Result<Rule, String> {
         body,
         rule_text,
         weight,
+        name,
     })
+}
+
+/// Extract `@weight(FLOAT)` and `@name("label")` annotations from a rule text,
+/// returning `(body_text, weight, name)`.
+///
+/// v0.87.0: `@weight(0.85)` anywhere after the rule body; the value must be in
+/// [0.0, 1.0], values outside this range trigger PT0301.
+/// v0.131.0 (VAL-208): `@name("label")` gives the rule a stable identity used
+/// as `_pg_ripple.derivations.rule_name`; the label must be a double-quoted,
+/// non-empty string (PT0302 otherwise).
+fn extract_annotations(text: &str) -> (&str, Option<f64>, Option<String>) {
+    let (after_name, name) = extract_name_annotation(text);
+    let (body, weight) = extract_weight_annotation(after_name);
+    (body, weight, name)
 }
 
 /// Extract `@weight(FLOAT)` annotation from a rule text, returning (body_text, weight).
@@ -167,6 +198,48 @@ fn extract_weight_annotation(text: &str) -> (&str, Option<f64>) {
                 }
             }
         }
+    }
+    (text, None)
+}
+
+/// Extract `@name("label")` from a rule text, returning
+/// `(text_without_annotation, Some(label))`.
+///
+/// VAL-208: the label may contain any character except an unescaped closing
+/// double quote; the empty label is rejected.  Malformed annotations abort with
+/// PT0302 instead of silently degrading the rule's derivation identity.
+fn extract_name_annotation(text: &str) -> (&str, Option<String>) {
+    if let Some(pos) = text.rfind("@name(") {
+        let annotation = &text[pos + 6..]; // "6" = len("@name(")
+        let mut chars = annotation.chars();
+        if chars.next() == Some('"') {
+            let mut label = String::new();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        // Keep the escape verbatim ("\"" and "\\" survive).
+                        if let Some(next) = chars.next() {
+                            label.push('\\');
+                            label.push(next);
+                        }
+                    }
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
+                    _ => label.push(c),
+                }
+            }
+            if !closed {
+                pgrx::error!("invalid @name annotation: unterminated label (PT0302)");
+            }
+            if label.trim().is_empty() {
+                pgrx::error!("invalid @name annotation: label must not be empty (PT0302)");
+            }
+            return (&text[..pos], Some(label));
+        }
+        pgrx::error!("invalid @name annotation: expected a double-quoted label (PT0302)");
     }
     (text, None)
 }
@@ -978,7 +1051,7 @@ fn term_to_const(term: &Term) -> Result<i64, String> {
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "parser_tests.rs"]
 mod tests;

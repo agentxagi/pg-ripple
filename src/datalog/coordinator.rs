@@ -10,7 +10,8 @@
 //! left empty for this iteration (retried next round).
 
 use super::{
-    BodyLiteral, Rule, Term, check_aggregation_stratification, compile_aggregate_rule, parse_rules,
+    BodyLiteral, Rule, Term, attach_catalog_name, check_aggregation_stratification,
+    compile_aggregate_rule, parse_rules,
 };
 use crate::datalog::parallel::{ParallelAnalysis, execute_with_savepoint};
 use pgrx::prelude::*;
@@ -47,8 +48,10 @@ pub fn execute_stratum_batch(stmts: &[String], stratum_index: usize, worker_id: 
 pub fn run_inference_agg(rule_set_name: &str) -> (i64, i64, i32) {
     super::ensure_catalog();
 
-    let rule_rows: Vec<String> = {
-        let sql = "SELECT rule_text \
+    let rule_rows: Vec<(String, Option<String>)> = {
+        // VAL-208: the stored rule text has the @name annotation stripped —
+        // carry the catalog name so the parsed rule keeps its identity.
+        let sql = "SELECT rule_text, name \
                    FROM _pg_ripple.rules \
                    WHERE rule_set = $1 AND active = true \
                    ORDER BY stratum, id";
@@ -56,7 +59,11 @@ pub fn run_inference_agg(rule_set_name: &str) -> (i64, i64, i32) {
             client
                 .select(sql, None, &[pgrx::datum::DatumWithOid::from(rule_set_name)])
                 .unwrap_or_else(|e| pgrx::error!("rule select SPI error: {e}"))
-                .map(|row| row.get::<String>(1).ok().flatten().unwrap_or_default())
+                .map(|row| {
+                    let text: String = row.get::<String>(1).ok().flatten().unwrap_or_default();
+                    let name: Option<String> = row.get::<String>(2).ok().flatten();
+                    (text, name)
+                })
                 .collect::<Vec<_>>()
         })
     };
@@ -66,9 +73,12 @@ pub fn run_inference_agg(rule_set_name: &str) -> (i64, i64, i32) {
     }
 
     let mut all_rules: Vec<Rule> = Vec::new();
-    for rule_text in &rule_rows {
+    for (rule_text, catalog_name) in &rule_rows {
         match parse_rules(rule_text, rule_set_name) {
-            Ok(rs) => all_rules.extend(rs.rules),
+            Ok(mut rs) => {
+                attach_catalog_name(&mut rs.rules, catalog_name.as_deref());
+                all_rules.extend(rs.rules);
+            }
             Err(e) => pgrx::warning!("infer_agg: rule parse error: {e}"),
         }
     }

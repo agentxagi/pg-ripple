@@ -211,7 +211,8 @@ fn detect_runtime(ruleset: &str) -> Value {
     // promoted deltas, source = 1) — VAL-207: derived rows for promoted
     // predicates live in {vp}_delta, so a vp_rare-only join goes blind.
     let derived = crate::datalog::derivations::derived_rows_expr();
-    let sql_multi_val = format!("\
+    let sql_multi_val = format!(
+        "\
         SELECT d1.rule_name AS rule_a, d2.rule_name AS rule_b, vr1.p AS pred_id \
         FROM _pg_ripple.derivations d1 \
         JOIN _pg_ripple.derivations d2 \
@@ -220,7 +221,8 @@ fn detect_runtime(ruleset: &str) -> Value {
         JOIN {derived} vr1 ON vr1.i = d1.derived_sid \
         JOIN {derived} vr2 ON vr2.i = d2.derived_sid \
         WHERE vr1.s = vr2.s AND vr1.p = vr2.p AND vr1.o <> vr2.o \
-        LIMIT 20");
+        LIMIT 20"
+    );
 
     let multi_val_rows: Vec<(Option<String>, Option<String>, Option<i64>)> =
         Spi::connect(|client| {
@@ -244,6 +246,12 @@ fn detect_runtime(ruleset: &str) -> Value {
         });
 
     for (rule_a, rule_b, pred_id) in multi_val_rows {
+        // VAL-208: derivations store rule identities; report the resolved
+        // rule text (fallback: the identity itself).
+        let rule_a = rule_a
+            .map(|n| crate::datalog::derivations::resolve_rule_text(ruleset, &n).unwrap_or(n));
+        let rule_b = rule_b
+            .map(|n| crate::datalog::derivations::resolve_rule_text(ruleset, &n).unwrap_or(n));
         let pred_iri = pred_id
             .and_then(crate::dictionary::decode)
             .unwrap_or_else(|| format!("<dict:{}>", pred_id.unwrap_or(0)));
@@ -275,7 +283,8 @@ fn detect_runtime(ruleset: &str) -> Value {
             None => continue,
         };
 
-        let sql_disjoint = format!("\
+        let sql_disjoint = format!(
+            "\
             SELECT d1.rule_name AS rule_a, d2.rule_name AS rule_b \
             FROM _pg_ripple.derivations d1 \
             JOIN _pg_ripple.derivations d2 \
@@ -283,7 +292,8 @@ fn detect_runtime(ruleset: &str) -> Value {
             JOIN {derived} vr1 ON vr1.i = d1.derived_sid AND vr1.p = $2 \
             JOIN {derived} vr2 ON vr2.i = d2.derived_sid AND vr2.p = $3 \
             WHERE vr1.s = vr2.s \
-            LIMIT 10");
+            LIMIT 10"
+        );
 
         let disjoint_rows: Vec<(Option<String>, Option<String>)> = Spi::connect(|client| {
             client
@@ -309,6 +319,11 @@ fn detect_runtime(ruleset: &str) -> Value {
         });
 
         for (rule_a, rule_b) in disjoint_rows {
+            // VAL-208: resolve identities to rule text, as above.
+            let rule_a = rule_a
+                .map(|n| crate::datalog::derivations::resolve_rule_text(ruleset, &n).unwrap_or(n));
+            let rule_b = rule_b
+                .map(|n| crate::datalog::derivations::resolve_rule_text(ruleset, &n).unwrap_or(n));
             conflicts.push(json!({
                 "mode": "runtime",
                 "rule_a": rule_a,

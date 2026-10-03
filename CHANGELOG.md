@@ -7,6 +7,33 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
 
+
+## [0.131.0]
+
+### Added
+
+- **Stable rule identity for derivations (VAL-208, RULE-NAME).** Datalog
+  rules accept an `@name("label")` annotation (PT0302 on malformed or
+  duplicate labels within one load); rules without one get the auto
+  fingerprint `auto:<first 12 hex of md5(rule_text)>`.  `_pg_ripple.rules`
+  gains a `name` column (unique per rule set) and
+  `_pg_ripple.derivations.rule_name` stores that identity instead of the full
+  rule text — no more inflated rows, and aggregations read a stable name.
+  `justify()` proof-tree nodes carry the resolved rule text (`rule`) plus the
+  stable identity (`rule_name`); runtime conflict reports resolve identities
+  to text the same way.
+
+### Changed
+
+- **Edited rules no longer duplicate derivations (VAL-208, STALE-PRUNE).**
+  `store_rules()` prunes derivation rows of rules that no longer exist in the
+  set (removed, or edited — an edit is a new identity), so a fact re-derived
+  by the current rules never accumulates rows under vanished names; UNIQUE
+  `(derived_sid, rule_name)` is stable again.  Identical duplicated rules in
+  one load collapse to a single catalog row; `add_rule()` under an existing
+  name refreshes the rule's definition.  Legacy derivation rows are converted
+  in place by the 0.130.0 → 0.131.0 migration.
+
 ## [0.130.0]
 
 ### Added

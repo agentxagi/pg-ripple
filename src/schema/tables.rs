@@ -485,7 +485,9 @@ pgrx::extension_sql!(
 --
 -- Columns:
 --   derived_sid     — statement ID (vp_rare.i) of the inferred triple
---   rule_name       — the raw Datalog rule text (used as the human-readable name)
+--   rule_name       — the rule's stable identity: the explicit @name("label")
+--                     annotation or 'auto:<md5-12 of rule_text>' (VAL-208);
+--                     display surfaces resolve the text via _pg_ripple.rules
 --   rule_set        — the rule set this rule belongs to (e.g. 'rdfs', 'owl-rl')
 --   antecedent_sids — array of statement IDs of the body-atom triples that
 --                     satisfied the rule for this specific derivation
