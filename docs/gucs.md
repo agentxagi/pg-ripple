@@ -345,11 +345,11 @@ The following GUCs were added in v0.116.0 (A16 milestone):
 
 ## Advisory Lifecycle Policy
 
-GUC-related security advisories are tracked in `audit.toml` under a quarterly review schedule:
+GUC-related security advisories are tracked in `.cargo/audit.toml` under a quarterly review schedule:
 
 1. **Open advisory** → triage within one sprint.
 2. **Ignore with expiry** → add `[ignore]` entry with `expires` at most 12 months out.
 3. **Quarterly review** → when an expiry approaches, re-evaluate the threat model.
 4. **Expiry forces re-decision** → expired entries are treated as new findings.
 
-See [`audit.toml`](../audit.toml) for the full advisory ignore list.
+See [`.cargo/audit.toml`](../.cargo/audit.toml) for the full advisory ignore list.
