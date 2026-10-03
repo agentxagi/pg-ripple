@@ -102,6 +102,39 @@ fn tokenize_rules(text: &str) -> Vec<String> {
                 }
                 current.clear();
             }
+            '@' if !in_literal && !in_iri => {
+                // Annotation (`@weight(FLOAT)`, `@name("label")`) or a language
+                // tag (`"foo"@en`).  Annotations are swallowed whole so the '.'
+                // of a float like `@weight(0.5)` cannot split the rule (VAL-353);
+                // a ')' inside the quoted label does not close the annotation.
+                current.push(c);
+                i += 1;
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '-')
+                {
+                    current.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == '(' {
+                    current.push('(');
+                    i += 1;
+                    while i < chars.len() {
+                        let a = chars[i];
+                        if a == '"' {
+                            in_literal = !in_literal;
+                            current.push(a);
+                        } else if a == ')' && !in_literal {
+                            current.push(a);
+                            i += 1;
+                            break;
+                        } else {
+                            current.push(a);
+                        }
+                        i += 1;
+                    }
+                }
+                continue;
+            }
             '#' if !in_literal && !in_iri => {
                 // Line comment — skip until end of line.
                 while i < chars.len() && chars[i] != '\n' {
@@ -1052,6 +1085,5 @@ fn term_to_const(term: &Term) -> Result<i64, String> {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(any(test, feature = "pg_test"))]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "parser_tests.rs"]
-mod tests;
+mod parser_tests;

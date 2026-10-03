@@ -56,6 +56,19 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   the current builtin rule sets — deterministic across consecutive runs, the
   recorded order/count predated the constants-aware subsumption and
   stable-rule-identity changes.
+- **`pg_test` suite green: parser tests reachable again and `@weight(FLOAT)`
+  no longer splits rules (VAL-353).** The v0.122.0 (H17-02) extraction of the
+  Datalog parser tests into `parser_tests.rs` behind a bare `#[path]` include
+  lost the `tests` schema mapping in pgrx 0.18's SQL generator: the five
+  `#[pg_test]` functions added with `@name` (v0.131.0) were emitted
+  unqualified, so the test framework's `SELECT tests.test_*()` failed with
+  `function ... does not exist` — the only red step of the repo's first CI
+  run. The module is now an inline `#[pgrx::pg_schema] mod tests` (same shape
+  as `src/lib_tests.rs`). Independently, `tokenize_rules()` split a rule at
+  the `.` of a float weight — `@weight(0.5)` parsed as two "rules" since the
+  annotation's introduction (v0.87.0); annotations are now swallowed whole
+  (quote-aware, so `)` inside an `@name("...")` label does not close it),
+  while language tags (`"chat"@pt`) keep terminating at the rule dot.
 
 ## [0.130.0]
 
