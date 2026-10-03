@@ -13,7 +13,10 @@ SQL executed inside extension code.
 ## Build and Test
 
 ```bash
-# Install pgrx against PG18
+# Check where pgrx is aimed BEFORE anything else — init rewrites this file,
+# and on a host that runs a production cluster $(which pg_config) is that
+# cluster (see the warning below). Prefer an isolated PG18:
+#   cargo pgrx init --pg18 download
 cargo pgrx init --pg18 $(which pg18)
 
 # Run all unit and integration tests
@@ -34,6 +37,14 @@ cargo clippy --features pg18 -- -D warnings
 # Install locally
 cargo pgrx install --pg-config $(which pg_config)
 ```
+
+> **Warning — hosts that run a production PostgreSQL cluster:** `cargo pgrx
+> init` rewrites `~/.pgrx/config.toml` to the `pg_config` you pass, and
+> `install`/`test`/`regress` write the extension into that PostgreSQL's libdir
+> *before* running any test. On such a host `$(which pg_config)` is the
+> production server; verify `grep pg18 ~/.pgrx/config.toml` resolves to an
+> isolated install before building, and never point pgrx at the system
+> `pg_config`.
 
 ## Project Layout
 

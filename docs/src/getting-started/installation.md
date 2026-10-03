@@ -49,6 +49,14 @@ cargo pgrx init --pg18 $(which pg_config)
 cargo pgrx install --release --pg-config $(which pg_config)
 ```
 
+> **Warning — hosts that run a production PostgreSQL cluster:** `cargo pgrx
+> init` rewrites `~/.pgrx/config.toml` to the `pg_config` you pass, and `cargo
+> pgrx install`/`test`/`regress` write the extension into that PostgreSQL's
+> libdir *before* running any test. On such a host `$(which pg_config)` is the
+> production server. Use an isolated PostgreSQL instead (`cargo pgrx init
+> --pg18 download` builds one under `~/.pgrx`) and never point pgrx at the
+> system `pg_config`.
+
 ### Create the extension
 
 Connect to your database and run:
