@@ -38,6 +38,14 @@ cargo pgrx install --pg-config $(which pg_config) --release
 cargo pgrx install --pg-config /usr/lib/postgresql/18/bin/pg_config --release
 ```
 
+> **Running a production PostgreSQL on the same machine?** `install`, `test`
+> and `regress` write the extension into the libdir of the `pg_config` they
+> target — the next restart of that cluster loads the new build. Point test
+> builds at an isolated pgrx-managed install (`cargo pgrx init --pg18
+> <explicit non-production pg_config>`, then `cargo pgrx install --pg-config
+> <that pg_config>`); reserve a system `pg_config` target for deliberate
+> production installs in a maintenance window.
+
 ### PostgreSQL Configuration
 
 Add to `postgresql.conf`:

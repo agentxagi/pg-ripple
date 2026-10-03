@@ -56,7 +56,13 @@ jobs:
           path: ~/.cargo/bin/cargo-pgrx
           key: ${{ runner.os }}-cargo-pgrx-${{ env.PGRX_VERSION }}
 
-      - name: Install PostgreSQL 18 from PGDG
+      - name: Cache pgrx-managed PostgreSQL 18
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5
+        with:
+          path: ~/.pgrx
+          key: ${{ runner.os }}-pgrx-home-${{ env.PGRX_VERSION }}
+
+      - name: Install PGDG PostgreSQL client and build deps
         run: |
           sudo apt-get install -y --no-install-recommends curl ca-certificates lsb-release
           sudo install -d /usr/share/postgresql-common/pgdg
@@ -66,10 +72,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libssl-dev libclang-dev clang lld \
-            postgresql-18 postgresql-server-dev-18
-          sudo chown -R "$USER" \
-            /usr/share/postgresql/18/extension \
-            /usr/lib/postgresql/18/lib
+            libreadline-dev zlib1g-dev libicu-dev postgresql-client-18
 
       - name: Install cargo-pgrx
         run: |
@@ -78,7 +81,7 @@ jobs:
           fi
 
       - name: Initialise pgrx (PostgreSQL 18)
-        run: cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
+        run: cargo pgrx init --pg18 download
 
       - name: Start pgrx PostgreSQL 18
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"

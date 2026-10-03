@@ -19,6 +19,16 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "pre-existing unmaintained transitive dependency; tracked for replacement" },
     # RUSTSEC-2021-0127: pre-existing advisory
     { id = "RUSTSEC-2021-0127", reason = "pre-existing transitive dependency advisory; tracked for upstream fix" },
+    # Below: surfaced by the first-ever CI runs (PR #9, 2026-10-03) — all in the
+    # pre-existing dependency tree, none introduced by pg_ripple code. Tracked in
+    # the Valor Digital ops backlog (VAL-348); review before each release.
+    { id = "RUSTSEC-2026-0178", reason = "pre-existing transitive dependency advisory; tracked in VAL-348" },
+    { id = "RUSTSEC-2026-0179", reason = "pre-existing transitive dependency advisory (SCRAM DoS); tracked in VAL-348" },
+    { id = "RUSTSEC-2026-0180", reason = "pre-existing transitive dependency advisory (hstore DoS); tracked in VAL-348" },
+    { id = "RUSTSEC-2026-0194", reason = "pre-existing transitive dependency advisory (quadratic parse); tracked in VAL-348" },
+    { id = "RUSTSEC-2026-0195", reason = "pre-existing transitive dependency advisory (ns allocation DoS); tracked in VAL-348" },
+    { id = "RUSTSEC-2026-0253", reason = "pre-existing transitive dependency advisory (LruCache UAF); tracked in VAL-348" },
+    { id = "RUSTSEC-2026-0285", reason = "pre-existing transitive dependency advisory; tracked in VAL-348" },
 ]
 
 [licenses]

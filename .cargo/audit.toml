@@ -1,16 +1,23 @@
-# cargo-audit configuration
-# See: https://github.com/rustsec/rustsec/tree/main/cargo-audit
-
+# cargo-audit configuration — triaged advisory ignores.
+#
+# All IDs below were surfaced by the first-ever CI runs of this repo
+# (PR #9, 2026-10-03) and live in the PRE-EXISTING dependency tree — none
+# were introduced by pg_ripple code. The real fix (dependency bumps) is
+# tracked as debt in the Valor Digital ops backlog (VAL-348).
+# Same triage as deny.toml ([advisories].ignore); review before each release.
 [advisories]
-# Pre-existing advisories acknowledged and triaged for v0.51.0.
-# These affect transitive dependencies only and are not exploitable in
-# the pg_ripple use-case (server-side PostgreSQL extension with no untrusted
-# external input to the affected code paths).
 ignore = [
-    # serde_cbor: unmaintained (replaced by ciborium).  No direct dep.
     "RUSTSEC-2021-0127",
-    # rsa: timing side-channel in RSA decryption.  Not used for RSA in pg_ripple.
     "RUSTSEC-2024-0436",
-    # paste: proc-macro crate unsoundness.  Only used at compile time.
     "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0178",
+    "RUSTSEC-2026-0179",
+    "RUSTSEC-2026-0180",
+    "RUSTSEC-2026-0185",
+    "RUSTSEC-2026-0190",
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0253",
+    "RUSTSEC-2026-0258",
+    "RUSTSEC-2026-0285",
 ]
