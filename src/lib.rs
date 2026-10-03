@@ -442,6 +442,12 @@ pub extern "C-unwind" fn _PG_init() {
     // shared_preload_libraries context.  When loaded via CREATE EXTENSION the
     // hooks have already fired; skip to avoid the "PgAtomic was not
     // initialized" panic.
+    // SAFETY: `ParallelWorkerNumber` is a PostgreSQL global (PGDLLIMPORT)
+    // initialised to -1 in every process and set to a non-negative value
+    // only in parallel workers before library loading. Reading it here is
+    // a plain, thread-free load with no interleaved writers.
+    let in_parallel_worker = unsafe { pg_sys::ParallelWorkerNumber >= 0 };
+
     // SAFETY: `process_shared_preload_libraries_in_progress` is a stable
     // PostgreSQL global set by the postmaster before loading shared libraries.
     // Reading it is safe at any point during extension initialisation.
@@ -457,7 +463,7 @@ pub extern "C-unwind" fn _PG_init() {
         // Register ExecutorEnd hook to poke the merge worker latch when the
         // accumulated unmerged delta row count crosses the trigger threshold.
         register_executor_end_hook();
-    } else if !unsafe { pg_sys::ParallelWorkerNumber >= 0 } {
+    } else if !in_parallel_worker {
         // PRELOAD-WARN-01 (v0.81.0): warn when loaded without shared_preload_libraries.
         // HTAP merge worker, CONSTRUCT writeback, and the dictionary shmem cache are
         // all disabled in this mode.
@@ -467,10 +473,6 @@ pub extern "C-unwind" fn _PG_init() {
         // plan spawns a variable number of workers and each one loads this
         // library and warns, so client output (regression tests included)
         // varies run to run. Only the leader backend warns.
-        // SAFETY: `ParallelWorkerNumber` is a PostgreSQL global (PGDLLIMPORT)
-        // initialised to -1 in every process and set to a non-negative value
-        // only in parallel workers before library loading. Reading it here is
-        // a plain, thread-free load with no interleaved writers.
         pgrx::warning!(
             "pg_ripple: loaded without shared_preload_libraries; \
              HTAP merge worker, CONSTRUCT writeback, and dictionary cache are disabled. \
