@@ -361,7 +361,9 @@ The table below shows which pg_ripple features require pg_trickle and which ship
 git clone https://github.com/trickle-labs/pg-ripple.git
 cd pg-ripple
 
-# Initialise pgrx for PostgreSQL 18
+# Initialise pgrx for PostgreSQL 18 — on a machine that ALSO runs a production
+# PostgreSQL cluster, $(which pg_config) is that cluster: init against an
+# isolated PG18 instead (see the warning below) before running anything else
 cargo pgrx init --pg18 $(which pg_config)
 
 # Run tests
@@ -370,6 +372,15 @@ cargo pgrx test pg18
 # Install into your local PostgreSQL
 cargo pgrx install --pg-config $(which pg_config)
 ```
+
+> **Warning — hosts that run a production PostgreSQL cluster:** `cargo pgrx init`
+> rewrites `~/.pgrx/config.toml` to the `pg_config` you pass, and `cargo pgrx
+> install`/`test`/`regress` write the extension into that PostgreSQL's libdir
+> *before* running any test. On such a host `$(which pg_config)` is the
+> production server, and a plain `test`/`install` overwrites the live `.so`
+> (the next restart loads unreviewed code). Point pgrx at an isolated
+> PostgreSQL instead — `cargo pgrx init --pg18 download` builds one under
+> `~/.pgrx` — and never init or install against the system `pg_config`.
 
 ### Enable the extension
 

@@ -103,47 +103,63 @@ All user-visible objects live in the `pg_ripple` schema; internal tables and VP 
 
 > **Production host warning (agentxagi fork).** On the Valor Digital host the
 > system `pg_config` (`/usr/bin/pg_config`, `/usr/lib/postgresql/18/bin/pg_config`)
-> belongs to the **production** cluster (port 5433). Every build-or-install
-> command — `cargo pgrx install`, `test` and `regress` — writes the extension
-> into the libdir/extension dir of the pg_config it resolves: the `--pg-config`
-> you pass, else the **active `pg18` entry in `~/.pgrx/config.toml`** — and
-> without `--release` that is a debug build. This has overwritten the production
-> `.so` three times (2026-09-29 16:13, 2026-09-30 00:30, 2026-10-02 23:00 —
-> VAL-210 / VAL-345); the next PostgreSQL restart loads whatever was written.
+> belongs to the **production** cluster (port 5433). Two coupled traps:
 >
-> **`cargo pgrx init` REWRITES `~/.pgrx/config.toml`.** Running `init` with a
-> system `pg_config` silently re-arms the trap: a containment done earlier is
-> undone by the next `init` (exactly what happened on 2026-10-02). Never run
-> `cargo pgrx init --pg18 /usr/bin/pg_config` or any `$(which pg_config)` /
-> `$(which pg18)`-style substitution on that host — the sample below uses the
-> isolated path explicitly.
+> 1. `cargo pgrx init` **rewrites** `~/.pgrx/config.toml` to whatever `pg_config`
+>    it is given. A single `cargo pgrx init --pg18 $(which pg_config)` re-arms
+>    every later `cargo pgrx test`/`regress`/`install` at the production
+>    directories — this exact sequence overwrote the production `.so` on
+>    2026-09-29 16:13, 2026-09-30 00:30 and 2026-10-02 23:00 (VAL-210/VAL-345).
+> 2. `cargo pgrx install`, `test` and `regress` write the extension into the
+>    libdir of the `pg_config` they resolve to **before** starting their own
+>    test cluster (cargo-pgrx 0.18.0, `install.rs:285`), and without `--release`
+>    that is a debug build. The postmaster keeps running the old inode, so the
+>    next restart silently loads unreviewed code.
 >
-> - Tests (the ONLY allowed configuration on that host): keep `pg18` in
->   `~/.pgrx/config.toml` pointing at the isolated pgrx install, and pass it
->   explicitly to install-type commands:
->   `/var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config`.
+> On that host:
+>
+> - Check where pgrx is aimed **before any build**: `grep pg18 ~/.pgrx/config.toml`.
+>   Healthy value: `/var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config`
+>   (isolated pgrx-home). Never run `cargo pgrx init` with the system `pg_config`,
+>   and do not re-init at all while the isolated value is already in place.
+> - Tests: `cargo pgrx test pg18` / `cargo pgrx regress pg18` resolve `pg18`
+>   through `~/.pgrx/config.toml` — safe only with the isolated value above.
+>   For an artifact without touching any live cluster:
+>   `cargo pgrx package --pg-config /var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config`,
+>   then load it in an ephemeral cluster you own.
 > - Shipping to production: `cargo pgrx package --pg-config /usr/lib/postgresql/18/bin/pg_config`
 >   (release by default; writes only under the target dir). Copy the `.so` and the
 >   `extension/` files in a maintenance window, restart PostgreSQL, then confirm the
 >   postmaster log says `merge worker 0 starting (release build`.
 
 ```bash
-# Install and test against the ISOLATED pgrx PG18 sandbox (pgrx-home).
-# NEVER the system pg_config: on the Valor Digital host that is production.
-cargo pgrx init --pg18 /var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config
+# 1. Check WHERE pgrx is aimed before building — `cargo pgrx init` rewrites
+#    this file, and a re-init against the system pg_config is the #1 incident
+#    cause on the production host:
+grep pg18 ~/.pgrx/config.toml
+# healthy: pg18 = "/var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config"
+# armed:   pg18 = "/usr/lib/postgresql/18/bin/pg_config"  -> STOP, re-isolate first
+#
+# If the entry is missing, init ONLY against an isolated (non-system) PG18 —
+# either the host's pgrx-home:
+#   cargo pgrx init --pg18 /var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config
+# or a pgrx-built PG18 under ~/.pgrx (nothing shared with the system):
+#   cargo pgrx init --pg18 download
+
+# 2. Tests — pgrx-managed or otherwise NON-production PG18 only
 cargo pgrx test pg18
 
-# Run pgregress suite (follows the active ~/.pgrx/config.toml entry — keep it isolated)
+# 3. pg_regress suite (installs into the libdir that pg18 resolves to — step 1)
 cargo pgrx regress pg18
 
-# Run migration chain test (verifies all migration SQL scripts in sequence)
+# 4. Migration chain test (verifies all migration SQL scripts in sequence)
 # Requires pgrx PG18 running: cargo pgrx start pg18
 bash tests/test_migration_chain.sh
 # Or via justfile:
 just test-migration
 
-# Install into the isolated pgrx-home PG18 instance (never the system pg_config
-# on a host that runs a production cluster — see the warning above)
+# 5. Install into a local, NON-production PG18 — always an explicit, isolated
+#    pg_config; never $(which pg_config) on a host that runs a production cluster
 cargo pgrx install --release --pg-config /var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config
 ```
 

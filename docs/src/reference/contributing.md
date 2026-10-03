@@ -37,6 +37,12 @@ cargo pgrx init --pg18 $(which pg_config)
 cargo build
 ```
 
+> **Warning — hosts that run a production PostgreSQL cluster:** `cargo pgrx
+> init` rewrites `~/.pgrx/config.toml` to the `pg_config` you pass, and later
+> `test`/`regress`/`install` write into that PostgreSQL's libdir. On such a
+> host `$(which pg_config)` is the production server — init against an
+> isolated PG18 instead (`cargo pgrx init --pg18 download`).
+
 ```admonish tip title="macOS"
 On macOS, install PostgreSQL 18 via Homebrew: `brew install postgresql@18`. Ensure `pg_config` is on your `PATH`.
 ```

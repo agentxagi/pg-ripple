@@ -38,13 +38,15 @@ cargo pgrx install --pg-config $(which pg_config) --release
 cargo pgrx install --pg-config /usr/lib/postgresql/18/bin/pg_config --release
 ```
 
-> **Running a production PostgreSQL on the same machine?** `install`, `test`
-> and `regress` write the extension into the libdir of the `pg_config` they
-> target — the next restart of that cluster loads the new build. Point test
-> builds at an isolated pgrx-managed install (`cargo pgrx init --pg18
+> **Warning — deploying on the host that runs the live cluster:** `cargo pgrx
+> install` writes straight into that PostgreSQL's libdir while the server is
+> running; the postmaster keeps the old inode mapped, so the change only takes
+> effect at the next restart — loading code nobody validated in that state.
+> Point test builds at an isolated pgrx-managed install (`cargo pgrx init --pg18
 > <explicit non-production pg_config>`, then `cargo pgrx install --pg-config
-> <that pg_config>`); reserve a system `pg_config` target for deliberate
-> production installs in a maintenance window.
+> <that pg_config>`); ship with `cargo pgrx package --pg-config …` (writes only
+> under `target/`), then copy the artifacts during a maintenance window and
+> restart deliberately.
 
 ### PostgreSQL Configuration
 
