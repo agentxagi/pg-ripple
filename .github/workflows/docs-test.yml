@@ -64,15 +64,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libssl-dev libclang-dev clang lld \
             postgresql-18 postgresql-server-dev-18
-          sudo chown -R "$USER" \
-            /usr/share/postgresql/18/extension \
-            /usr/lib/postgresql/18/lib
 
       - name: Initialize pgrx
-        run: cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
+        run: cargo pgrx init --pg18 /var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config
 
       - name: Install pg_ripple
-        run: cargo pgrx install --pg-config /usr/lib/postgresql/18/bin/pg_config
+        run: cargo pgrx install --pg-config /var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config
 
       - name: Start PostgreSQL
         run: cargo pgrx start pg18

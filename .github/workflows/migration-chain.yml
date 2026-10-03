@@ -67,9 +67,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libssl-dev libclang-dev clang lld \
             postgresql-18 postgresql-server-dev-18
-          sudo chown -R "$USER" \
-            /usr/share/postgresql/18/extension \
-            /usr/lib/postgresql/18/lib
 
       - name: Install cargo-pgrx
         run: |
@@ -78,7 +75,7 @@ jobs:
           fi
 
       - name: Initialise pgrx (PostgreSQL 18)
-        run: cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
+        run: cargo pgrx init --pg18 /var/lib/postgresql/pgrx-home/18.6/pgrx-install/bin/pg_config
 
       - name: Start pgrx PostgreSQL 18
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
