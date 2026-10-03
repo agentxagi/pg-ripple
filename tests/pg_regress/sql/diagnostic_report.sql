@@ -28,10 +28,11 @@ WHERE key IN (
 ORDER BY key;
 
 -- schema_version reflects the last schema change; compiled_version reflects the
--- Rust binary. For v0.78.0 schema_version was bumped, so sv = cv = 0.78.0.
+-- Rust binary. They advance independently (0.98.0 vs 0.131.0 today), so assert
+-- the shape, not the exact value.
 SELECT
-    (SELECT value FROM pg_ripple.diagnostic_report() WHERE key = 'schema_version') AS sv,
-    (SELECT value FROM pg_ripple.diagnostic_report() WHERE key = 'compiled_version') AS cv;
+    (SELECT value FROM pg_ripple.diagnostic_report() WHERE key = 'schema_version') ~ '^[0-9]+\.[0-9]+\.[0-9]+$' AS sv_semver,
+    (SELECT value FROM pg_ripple.diagnostic_report() WHERE key = 'compiled_version') ~ '^[0-9]+\.[0-9]+\.[0-9]+$' AS cv_semver;
 
 -- GUC values should be valid
 SELECT

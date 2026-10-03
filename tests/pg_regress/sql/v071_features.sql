@@ -9,7 +9,11 @@ CREATE EXTENSION IF NOT EXISTS pg_ripple;
 SELECT pg_ripple.triple_count() >= 0 AS library_loaded;
 SET search_path TO pg_ripple, public;
 
--- ── Part 1: FLIGHT-STREAM-01 — Arrow Flight streaming ────────────────────────
+-- Every parallel worker process loads the C library and emits the
+-- not-preloaded WARNING to the client; on a suite-warmed database the planner
+-- picks parallel plans and the warning count varies with the workers actually
+-- launched. Pin serial plans so the compared output is deterministic.
+SET max_parallel_workers_per_gather = 0;
 
 -- 1a. Arrow Flight feature is listed in feature_status with status experimental.
 SELECT status AS arrow_flight_status

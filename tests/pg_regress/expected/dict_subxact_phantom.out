@@ -32,9 +32,9 @@ BEGIN
         '<http://sub.test/a>', '<http://sub.test/p>', '"internado-e-desfeito"');
     RAISE EXCEPTION 'desfaz';
 EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'subtransacao_desfeita';
+    RAISE WARNING 'subtransacao_desfeita';
 END $$;
-NOTICE:  subtransacao_desfeita
+WARNING:  subtransacao_desfeita
 SELECT count(*) AS linha_no_dicionario
 FROM _pg_ripple.dictionary WHERE value = 'internado-e-desfeito';
  linha_no_dicionario 

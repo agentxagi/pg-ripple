@@ -34,6 +34,29 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   name refreshes the rule's definition.  Legacy derivation rows are converted
   in place by the 0.130.0 → 0.131.0 migration.
 
+### Fixed
+
+- **`pg_regress` suite green under `cargo pgrx regress` (VAL-351).** The
+  suite had never run under `cargo pgrx regress` until the repo's first CI;
+  seven expected outputs were stale or environment-fragile.
+  `cargo-pgrx` forces `client_min_messages=warning` on the regress cluster,
+  so NOTICE-based assertions can never print there — `shacl_write_guard` and
+  `dict_subxact_phantom` now `RAISE WARNING` in their exception handlers,
+  keeping the handler-path assertion visible under every runner.
+  `v071_features` and `vector_contextualize` pin
+  `max_parallel_workers_per_gather = 0`: every parallel worker loads the C
+  library and emits the not-preloaded WARNING to the client, and on a
+  suite-warmed database the planner picks parallel plans whose worker count
+  varies with the workers actually launched. `diagnostic_report` asserts the
+  semver shape of `schema_version`/`compiled_version` instead of pinning
+  `0.128.0`. `datalog_graph_var_rule` records the preload WARNING at its
+  full-suite position (the extension already exists, so the warning fires at
+  the first function call, not during `CREATE EXTENSION`) plus the missing
+  trailing newline. `datalog_parallel` expected output is regenerated for
+  the current builtin rule sets — deterministic across consecutive runs, the
+  recorded order/count predated the constants-aware subsumption and
+  stable-rule-identity changes.
+
 ## [0.130.0]
 
 ### Added

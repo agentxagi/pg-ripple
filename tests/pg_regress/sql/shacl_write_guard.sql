@@ -70,9 +70,9 @@ BEGIN
         '<http://guard.test/kind>',
         '"service"'
     );
-    RAISE NOTICE 'second_kind_accepted';
+    RAISE WARNING 'second_kind_accepted';
 EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'second_kind_rejected';
+    RAISE WARNING 'second_kind_rejected';
 END $$;
 
 -- A value outside the sh:in set is rejected.
@@ -83,9 +83,9 @@ BEGIN
         '<http://guard.test/kind>',
         '"person"'
     );
-    RAISE NOTICE 'bad_kind_accepted';
+    RAISE WARNING 'bad_kind_accepted';
 EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'bad_kind_rejected';
+    RAISE WARNING 'bad_kind_rejected';
 END $$;
 
 SELECT count(*) AS kind_values
