@@ -1,0 +1,23 @@
+-- Migration 0.140.1 → 0.140.2: ensure_catalog no longer emits DDL on the
+-- pg_ripple.infer() hot path (VAL-374).
+--
+-- Root cause (production incident 04/10 09:08-09:11, VAL-372 forensics):
+-- datalog::ensure_catalog() (src/datalog/mod.rs) ran unconditional DDL on
+-- EVERY infer() call — CREATE TABLE IF NOT EXISTS _pg_ripple.rules /
+-- _pg_ripple.rule_sets and ALTER TABLE _pg_ripple.predicates ADD COLUMN
+-- IF NOT EXISTS derived, rule_set. ADD COLUMN IF NOT EXISTS still takes
+-- ACCESS EXCLUSIVE on _pg_ripple.predicates when both columns already
+-- exist, and CREATE TABLE IF NOT EXISTS locks the existing relations, so
+-- any session holding ACCESS SHARE over the catalog (psql analytics, GC
+-- scans, backfills) blocked the KG write path until it committed (holder
+-- valorbrain:kg-maint, infer cancelled at 174 s).
+--
+-- Fix (Rust only — src/datalog/mod.rs):
+--   * a catalog probe (to_regclass + pg_attribute, the same guard shape
+--     the VAL-208 block already used) short-circuits ensure_catalog() when
+--     the catalog is complete — the hot path takes no DDL locks at all;
+--   * the DDL path still runs on first bootstrap and on pre-0.131.0
+--     upgrades missing rules.name or the uq_rules_set_name index.
+--
+-- No SQL objects change in this release: this script is a version marker so
+-- `ALTER EXTENSION pg_ripple UPDATE TO '0.140.2'` can walk 0.140.1 → 0.140.2.

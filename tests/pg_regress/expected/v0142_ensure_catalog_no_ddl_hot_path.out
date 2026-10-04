@@ -1,0 +1,108 @@
+-- pg_regress test: v0.140.2 — ensure_catalog probe-first: no DDL on the hot path (VAL-374)
+--
+-- Regression target: on 0.140.1 datalog::ensure_catalog() ran unconditional
+-- DDL on EVERY pg_ripple.infer() call (src/datalog/mod.rs, hot path of the
+-- engine write path src/kg-ripple.ts):
+--   CREATE TABLE IF NOT EXISTS _pg_ripple.rules
+--   CREATE TABLE IF NOT EXISTS _pg_ripple.rule_sets
+--   ALTER TABLE _pg_ripple.predicates
+--       ADD COLUMN IF NOT EXISTS derived BOOLEAN ..., rule_set TEXT
+-- ALTER TABLE takes ACCESS EXCLUSIVE on _pg_ripple.predicates even when both
+-- columns already exist, and CREATE TABLE IF NOT EXISTS locks the existing
+-- relations, so any session holding ACCESS SHARE over the catalog (psql
+-- analytics, GC scans, backfills) blocked the KG write path until it
+-- committed — the production incident of 04/10 09:08-09:11 (holder
+-- kg-maint, infer cancelled at 174 s; VAL-372 forensics).
+--
+-- Fix under test: a catalog probe (to_regclass + pg_attribute) short-circuits
+-- ensure_catalog() when the catalog is complete. Locks acquired inside a
+-- transaction survive until COMMIT/ROLLBACK, so if infer() still emitted DDL,
+-- its AccessExclusiveLock would still be visible in pg_locks immediately
+-- after the call, inside the same transaction.
+--
+-- Hermetic: cargo pgrx regress runs the whole suite in one shared database;
+-- on a fresh database the Datalog catalog (rules/rule_sets) is created
+-- lazily by the first loader call, so the test warms the hot path in
+-- autocommit BEFORE asserting catalog completeness — every assertion holds
+-- identically on a fresh and on the shared regress database. The only
+-- persistent state (one rule set) is dropped at the end.
+CREATE EXTENSION IF NOT EXISTS pg_ripple;
+SET search_path TO pg_ripple, public;
+SELECT pg_ripple.load_rules(
+    '?a <https://val374.test/ancestor> ?b :- ?a <https://val374.test/parent> ?b .',
+    'val374_hotpath') >= 0 AS rules_loaded;
+WARNING:  pg_ripple: loaded without shared_preload_libraries; HTAP merge worker, CONSTRUCT writeback, and dictionary cache are disabled. Add pg_ripple to shared_preload_libraries in postgresql.conf.
+ rules_loaded 
+--------------
+ t
+(1 row)
+
+-- Warm pass in autocommit: any pending bootstrap completes and commits here.
+SELECT pg_ripple.infer('val374_hotpath') >= 0 AS warm_pass;
+ warm_pass 
+-----------
+ t
+(1 row)
+
+-- Guard: the catalog really is complete before the hot path is re-exercised
+-- (proves the probe's own preconditions hold on a healthy catalog).
+SELECT to_regclass('_pg_ripple.rules') IS NOT NULL
+   AND to_regclass('_pg_ripple.rule_sets') IS NOT NULL
+   AND to_regclass('_pg_ripple.predicates') IS NOT NULL
+   AND EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = to_regclass('_pg_ripple.predicates')
+                  AND attname = 'derived' AND NOT attisdropped)
+   AND EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = to_regclass('_pg_ripple.predicates')
+                  AND attname = 'rule_set' AND NOT attisdropped)
+  AS catalog_complete;
+ catalog_complete 
+------------------
+ t
+(1 row)
+
+-- ─── Regression: infer() inside an open transaction must not hold any
+-- AccessExclusiveLock over the catalog relations. On 0.140.1 logic the
+-- ALTER TABLE lock survives until ROLLBACK and this count is >= 1.
+BEGIN;
+SELECT pg_ripple.infer('val374_hotpath') >= 0 AS hot_pass_in_txn;
+ hot_pass_in_txn 
+-----------------
+ t
+(1 row)
+
+SELECT count(*) AS ael_catalog_locks
+  FROM pg_locks
+ WHERE mode = 'AccessExclusiveLock'
+   AND relation IN ('_pg_ripple.rules'::regclass,
+                    '_pg_ripple.rule_sets'::regclass,
+                    '_pg_ripple.predicates'::regclass);
+ ael_catalog_locks 
+-------------------
+                 0
+(1 row)
+
+ROLLBACK;
+-- Positive control: DDL inside this same session DOES show up in pg_locks
+-- until transaction end, so the assertion above is not vacuously passing
+-- because pg_locks cannot see our own AccessExclusiveLocks.
+BEGIN;
+ALTER TABLE _pg_ripple.rule_sets
+    ADD COLUMN IF NOT EXISTS val374_probe_canary TEXT;
+SELECT count(*) AS ael_canary_visible
+  FROM pg_locks
+ WHERE mode = 'AccessExclusiveLock'
+   AND relation = '_pg_ripple.rule_sets'::regclass;
+ ael_canary_visible 
+--------------------
+                  1
+(1 row)
+
+ROLLBACK;
+-- Cleanup (hermetic suite): rule set and its catalog rows go away.
+SELECT pg_ripple.drop_rules('val374_hotpath') >= 0 AS rules_dropped;
+ rules_dropped 
+---------------
+ t
+(1 row)
+

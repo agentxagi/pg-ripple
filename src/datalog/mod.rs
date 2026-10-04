@@ -309,7 +309,44 @@ pub enum TemporalFilter {
 /// Ensure the Datalog catalog tables exist.
 /// Called idempotently from `load_rules`.
 pub fn ensure_catalog() {
-    // _pg_ripple.rules
+    // VAL-374 (v0.140.2): probe first, emit DDL only when something is
+    // missing.  Every pg_ripple.infer() call lands here, and the
+    // unconditional DDL below used to run even on a fully-bootstrapped
+    // catalog: ALTER TABLE _pg_ripple.predicates ADD COLUMN IF NOT EXISTS
+    // takes ACCESS EXCLUSIVE when the columns already exist, and CREATE
+    // TABLE IF NOT EXISTS locks the existing relations — so any session
+    // holding ACCESS SHARE over the catalog (psql analytics, GC scans,
+    // backfills) blocked the KG write path until it committed (production
+    // incident 04/10 09:08-09:11, VAL-372 forensics).  Same guard shape the
+    // VAL-208 block below already uses, hoisted to skip all DDL — locks and
+    // catalog-invalidation noise included — on the hot path.
+    let catalog_ready = Spi::get_one_with_args::<bool>(
+        "SELECT to_regclass('_pg_ripple.rules') IS NOT NULL \
+             AND to_regclass('_pg_ripple.rule_sets') IS NOT NULL \
+             AND EXISTS (SELECT 1 FROM pg_attribute \
+                          WHERE attrelid = to_regclass('_pg_ripple.rules') \
+                            AND attname = 'name' AND NOT attisdropped) \
+             AND EXISTS (SELECT 1 FROM pg_class \
+                          WHERE relname = 'uq_rules_set_name' AND relkind = 'i') \
+             AND EXISTS (SELECT 1 FROM pg_attribute \
+                          WHERE attrelid = to_regclass('_pg_ripple.predicates') \
+                            AND attname = 'derived' AND NOT attisdropped) \
+             AND EXISTS (SELECT 1 FROM pg_attribute \
+                          WHERE attrelid = to_regclass('_pg_ripple.predicates') \
+                            AND attname = 'rule_set' AND NOT attisdropped)",
+        &[],
+    )
+    .unwrap_or_else(|e| {
+        // A failed probe must not break callers that worked before: fall
+        // through to the DDL path, which surfaces the real error.
+        pgrx::warning!("datalog catalog probe failed: {e}");
+        None
+    })
+    .unwrap_or(false);
+    if catalog_ready {
+        return;
+    }
+
     Spi::run_with_args(
         "CREATE TABLE IF NOT EXISTS _pg_ripple.rules ( \
              id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
