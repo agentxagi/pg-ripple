@@ -1,0 +1,28 @@
+-- Migration 0.140.5 → 0.140.6
+--
+-- VAL-378: erase_subject() erasure completeness.
+--
+-- Defect (Rust only — src/security_api.rs): the GDPR erase path deleted
+-- VP rows with s = <erased id> only, but removed the subject's dictionary
+-- entry unconditionally.  Rows still referencing the erased id as an
+-- object (or graph) survived with an id that no longer resolved, and every
+-- SPARQL result decoding them warned
+--     "batch_decode: dictionary entry missing for id N"
+-- with an empty-string binding (graceful degradation).  Production
+-- evidence (ValorBrain KG, tenant graph b49feee2): id 60581, referenced
+-- by exactly one vp_{1393}_main row (s=40402, o=60581, g=7826, predicate
+-- kg/related_to) plus one object_patterns row; first occurrence
+-- 2026-09-28 04:13:58, re-seen during the 0.140.1 deploy verification
+-- (04/10 11:22-11:27).
+--
+-- Fix (Rust only): erase_subject now matches the erased id in every role
+-- (s/o/g) in vp_rare and all dedicated VP delta/main tables — with
+-- VAL-376 counter decrements per removed row — and additionally deletes
+-- the subject_patterns/object_patterns rows keyed by the id, the
+-- named_graphs registry row when the IRI was used as a graph, and the
+-- dictionary_hot cache entry for the id (a stale unlogged hot entry would
+-- hand the deleted id back to a future insert of the same IRI,
+-- re-creating the orphan).
+--
+-- No SQL objects change.
+-- Regression: tests/pg_regress/sql/v0146_erase_subject_object_refs.sql

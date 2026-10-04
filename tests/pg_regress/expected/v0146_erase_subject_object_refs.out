@@ -1,0 +1,125 @@
+-- pg_regress test: erase_subject object/graph references (v0.140.6, VAL-378)
+--
+-- Production defect (ValorBrain KG, tenant graph): erase_subject() deleted
+-- only rows with s = <erased id> but removed the dictionary entry
+-- unconditionally.  Rows still referencing the erased id as an OBJECT (or
+-- graph) survived with an undecodable id, and every SPARQL result decoding
+-- them emitted
+--     WARNING: batch_decode: dictionary entry missing for id 60581
+-- with an empty-string binding (graceful degradation, strict_dictionary=off).
+-- The 0.140.6 fix removes the id in every role (s/o/g) plus the pattern-cache
+-- rows, named-graph registry row and hot-cache entry keyed by it.
+--
+-- This test pins the fix: after erasing alice, bob's <knows> alice triple is
+-- gone (not an empty binding), no vp_rare row references her id in any role,
+-- the caches hold no residue, and the knows predicate counter is back to 0.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_ripple;
+WARNING:  pg_ripple: loaded without shared_preload_libraries; HTAP merge worker, CONSTRUCT writeback, and dictionary cache are disabled. Add pg_ripple to shared_preload_libraries in postgresql.conf.
+SET client_min_messages = DEFAULT;
+SET search_path TO pg_ripple, public;
+-- Graph with alice as a subject AND as the object of bob's knows triple.
+SELECT pg_ripple.load_ntriples_into_graph(
+  E'<http://val378.test/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://val378.test/Person> .\n' ||
+  E'<http://val378.test/bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://val378.test/Person> .\n' ||
+  E'<http://val378.test/bob> <http://val378.test/knows> <http://val378.test/alice> .\n' ||
+  E'<http://val378.test/bob> <http://val378.test/name> "Bob" .\n',
+  'http://val378.test/graph'
+) AS triples_loaded;
+ triples_loaded 
+----------------
+              4
+(1 row)
+
+-- Capture alice's dictionary id BEFORE the erase: the entry itself is deleted
+-- by erase_subject, so it cannot be looked up afterwards.
+CREATE TEMP TABLE val378_alice_id AS
+  SELECT id FROM _pg_ripple.dictionary WHERE value = 'http://val378.test/alice';
+-- Before: bob knows alice resolves to one row.
+SELECT count(*) AS knows_before
+FROM pg_ripple.sparql(
+  'SELECT ?s WHERE { GRAPH <http://val378.test/graph> { ?s <http://val378.test/knows> <http://val378.test/alice> } }'
+);
+ knows_before 
+--------------
+            1
+(1 row)
+
+-- Erase alice (subject rows + object references + dictionary entry >= 3).
+SELECT (SELECT COALESCE(SUM(rows_deleted), 0) FROM pg_ripple.erase_subject('http://val378.test/alice'::text)) >= 3 AS erased_ok;
+ erased_ok 
+-----------
+ t
+(1 row)
+
+-- After: the knows triple is physically gone — pre-fix it survived as a row
+-- whose object binding decoded to an empty string.
+SELECT count(*) AS knows_after
+FROM pg_ripple.sparql(
+  'SELECT ?s ?o WHERE { GRAPH <http://val378.test/graph> { ?s <http://val378.test/knows> ?o } }'
+);
+ knows_after 
+-------------
+           0
+(1 row)
+
+-- No vp_rare row references alice's id in ANY role — the orphan that fired
+-- the batch_decode WARNING.
+SELECT count(*) AS orphan_refs_after
+FROM _pg_ripple.vp_rare
+WHERE s = (SELECT id FROM val378_alice_id)
+   OR o = (SELECT id FROM val378_alice_id)
+   OR g = (SELECT id FROM val378_alice_id);
+ orphan_refs_after 
+-------------------
+                 0
+(1 row)
+
+-- Pattern caches and the hot encode cache hold no residue for the erased id.
+SELECT (SELECT count(*) FROM _pg_ripple.object_patterns
+         WHERE o = (SELECT id FROM val378_alice_id))
+     + (SELECT count(*) FROM _pg_ripple.subject_patterns
+         WHERE s = (SELECT id FROM val378_alice_id))
+     + (SELECT count(*) FROM _pg_ripple.dictionary_hot
+         WHERE id = (SELECT id FROM val378_alice_id)) AS cache_residue;
+ cache_residue 
+---------------
+             0
+(1 row)
+
+-- Catalog counter integrity (VAL-376 invariant): knows has no rows left,
+-- so triple_count must be back to zero.
+SELECT pr.triple_count AS knows_triple_count_after
+FROM _pg_ripple.predicates pr
+WHERE pr.id = (SELECT id FROM _pg_ripple.dictionary WHERE value = 'http://val378.test/knows');
+ knows_triple_count_after 
+--------------------------
+                        0
+(1 row)
+
+-- The dictionary entry for alice is gone.
+SELECT count(*) AS alice_dict_after
+FROM _pg_ripple.dictionary WHERE value = 'http://val378.test/alice';
+ alice_dict_after 
+------------------
+                0
+(1 row)
+
+-- Bob's own triples are untouched by the erase.
+SELECT count(*) AS bob_triples_after
+FROM pg_ripple.sparql(
+  'SELECT ?p ?o WHERE { GRAPH <http://val378.test/graph> { <http://val378.test/bob> ?p ?o } }'
+);
+ bob_triples_after 
+-------------------
+                 2
+(1 row)
+
+-- Cleanup.
+SELECT pg_ripple.drop_graph('http://val378.test/graph') IS NOT NULL AS dropped;
+ dropped 
+---------
+ t
+(1 row)
+
+DROP TABLE val378_alice_id;

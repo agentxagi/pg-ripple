@@ -6,6 +6,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
+## [0.140.6]
+
+Erasure completeness fix: `erase_subject()` now removes the erased id in
+every role — subject, object and graph (VAL-378).
+
+### Fixed
+
+- **`erase_subject()` left object references orphaned and undecodable.**
+  The GDPR erasure path (`src/security_api.rs`) deleted VP rows with
+  `s = <erased id>` only, but removed the subject's dictionary entry
+  unconditionally. Rows still referencing the erased id as an object (or
+  graph) survived with an id that no longer resolved, and every SPARQL
+  result decoding them emitted
+  `WARNING: batch_decode: dictionary entry missing for id N` with an
+  empty-string binding (production: id 60581, object of `kg/related_to`,
+  `vp_{1393}_main` row `s=40402, o=60581, g=7826` plus one `object_patterns`
+  row; first occurrence 2026-09-28 04:13:58, re-seen during the 0.140.1
+  deploy verification on 04/10 11:22–11:27). The erase now matches the id
+  in every role (s/o/g) across `vp_rare` and all dedicated VP delta/main
+  tables — with VAL-376 counter decrements on each removed row — and also
+  deletes the `subject_patterns`/`object_patterns` rows keyed by the id,
+  the `named_graphs` registry row when the IRI was used as a graph, and
+  evicts the id from the unlogged `dictionary_hot` cache (a stale hot
+  entry would hand the deleted id back to a future insert of the same
+  IRI, silently re-creating the orphan). Regression:
+  `tests/pg_regress/sql/v0146_erase_subject_object_refs.sql` reproduces
+  the WARNING on the unfixed build and pins the clean behavior.
+
 ## [0.140.4]
 
 Storage hygiene fix: re-asserting an existing triple keeps its statement ID
