@@ -24,8 +24,8 @@
 -- (load_nquads), matching the engine's tenant-graph write shape and keeping
 -- the any-graph SPARQL count meaningful.
 CREATE EXTENSION IF NOT EXISTS pg_ripple;
-WARNING:  pg_ripple: loaded without shared_preload_libraries; HTAP merge worker, CONSTRUCT writeback, and dictionary cache are disabled. Add pg_ripple to shared_preload_libraries in postgresql.conf.
 SELECT pg_ripple.triple_count() >= 0 AS library_loaded;
+WARNING:  pg_ripple: loaded without shared_preload_libraries; HTAP merge worker, CONSTRUCT writeback, and dictionary cache are disabled. Add pg_ripple to shared_preload_libraries in postgresql.conf.
  library_loaded 
 ----------------
  t
@@ -42,7 +42,6 @@ SELECT (SELECT count(*) FROM generate_series(1, 100) i
             'https://val371.test/e' || i,
             'https://val371.test/p1', '"a"',
             'https://val371.test/g1') IS NOT NULL) = 100 AS seed_p1_100_distinct;
-NOTICE:  trigger "cdc_notify_3" for relation "_pg_ripple.vp_3_delta" does not exist, skipping
  seed_p1_100_distinct 
 ----------------------
  t
@@ -100,7 +99,6 @@ SELECT pg_ripple.load_nquads(
         '<https://val371.test/f%s> <https://val371.test/p2> "x" <https://val371.test/g2> .', i),
         E'\n')
      FROM generate_series(1, 100) i), false) = 100 AS p2_load_100_distinct;
-NOTICE:  trigger "cdc_notify_107" for relation "_pg_ripple.vp_107_delta" does not exist, skipping
  p2_load_100_distinct 
 ----------------------
  t
