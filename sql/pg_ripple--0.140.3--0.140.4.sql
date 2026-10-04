@@ -1,0 +1,24 @@
+-- Migration 0.140.3 → 0.140.4: single-row upserts keep SID and row version
+-- stable across re-asserts (VAL-377).
+--
+-- Root cause: the dedicated-VP fast paths of insert_triple() /
+-- insert_encoded_triple() (src/storage/ops/mod.rs) upserted with
+--   ON CONFLICT (s, o, g) DO UPDATE SET i = EXCLUDED.i
+--   RETURNING i, (xmax = 0)
+-- The DEFAULT nextval('statement_id_seq') is evaluated for the proposed row
+-- on EVERY call, so each re-assert of an existing quad minted a new sequence
+-- value, rewrote the conflicting row (new tuple version: WAL churn/bloat
+-- under the re-assert-heavy production load — load-ripple.sh,
+-- backfill-ripple-sync.ts, entity re-ingestion), fired the delta
+-- CDC/timeline triggers as an UPDATE, and returned a different SID every
+-- time (641 → 642 → 643 observed during the VAL-365 root-cause).
+--
+-- Fix (Rust only — src/storage/ops/mod.rs):
+--   * vp_delta_upsert(): ON CONFLICT DO NOTHING plus a UNION ALL arm that
+--     selects the EXISTING row — one atomic statement, no rewrite on
+--     conflict, existing SID returned, fresh-row detection kept for the
+--     VAL-371 counter contract (only real inserts bump triple_count);
+--   * concurrent-commit race handled by a fallback re-read.
+--
+-- No SQL objects change in this release: this script is a version marker so
+-- `ALTER EXTENSION pg_ripple UPDATE TO '0.140.4'` can walk 0.140.3 → 0.140.4.

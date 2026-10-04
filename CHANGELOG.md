@@ -7,6 +7,32 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
 
+## [0.140.4]
+
+Write-path stability fix: re-asserting an existing triple no longer mints a
+new SID nor rewrites the VP delta row (VAL-377).
+
+### Fixed
+
+- **Single-row upserts rewrote the conflicting row and returned a new SID on
+  every re-assert.** The dedicated-VP fast paths of `insert_triple()` /
+  `insert_encoded_triple()` (`src/storage/ops/mod.rs`) upserted with
+  `ON CONFLICT (s, o, g) DO UPDATE SET i = EXCLUDED.i RETURNING i,
+  (xmax = 0)`. The `DEFAULT nextval('statement_id_seq')` is evaluated for
+  the proposed row on every call, so each re-assert consumed a sequence
+  value, produced a new tuple version (WAL churn/bloat under the
+  re-assert-heavy production load: `load-ripple.sh`,
+  `backfill-ripple-sync.ts`, entity re-ingestion), fired the delta
+  CDC/timeline triggers as an UPDATE, and returned a different SID every
+  time (641 → 642 → 643 observed during the VAL-365 root-cause) — breaking
+  any consumer that treats the SID as the stable identity of a row. The new
+  `vp_delta_upsert()` helper uses `ON CONFLICT DO NOTHING` plus a `UNION
+  ALL` arm that returns the EXISTING row: still one atomic statement, zero
+  rewrite on conflict, existing SID returned, and the VAL-371 contract is
+  preserved (only real inserts bump `triple_count`; a concurrent-commit race
+  is handled by a fallback re-read). Regression:
+  `tests/pg_regress/sql/v0144_sid_stable_reassert.sql`.
+
 ## [0.140.2]
 
 Hot-path lock fix: `ensure_catalog()` no longer emits DDL on every `infer()`

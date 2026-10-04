@@ -1,0 +1,160 @@
+-- pg_regress test: v0.140.4 — single-row upserts keep SID and row version
+-- stable across re-asserts (VAL-377)
+--
+-- Regression target: 0.140.1's single-row upsert (src/storage/ops/mod.rs,
+-- insert_triple / insert_encoded_triple dedicated-VP fast paths)
+--   INSERT INTO vp_{id}_delta (s, o, g) VALUES (...)
+--   ON CONFLICT (s, o, g) DO UPDATE SET i = EXCLUDED.i
+--   RETURNING i, (xmax = 0)
+-- evaluated the DEFAULT nextval('statement_id_seq') for the proposed row on
+-- EVERY call, so a re-assert of an existing quad:
+--   * returned a different SID each time (641 -> 642 -> 643 observed during
+--     the VAL-365 root-cause);
+--   * rewrote the conflicting row (new tuple version: WAL churn/bloat under
+--     the re-assert-heavy production load — load-ripple.sh,
+--     backfill-ripple-sync.ts, entity re-ingestion);
+--   * fired the delta CDC/timeline triggers as an UPDATE.
+--
+-- Fix under test: vp_delta_upsert() uses ON CONFLICT DO NOTHING plus a
+-- UNION ALL arm that returns the EXISTING row — one atomic statement, no
+-- rewrite on conflict, existing SID returned, fresh-row detection kept for
+-- the VAL-371 counter contract.
+--
+-- Layout mirrors v0141: 100 DISTINCT seed triples cross the promotion
+-- threshold, so the probe inserts below take the dedicated-VP fast path
+-- (vp_promotion_threshold bottoms out at 100).
+
+CREATE EXTENSION IF NOT EXISTS pg_ripple;
+SELECT pg_ripple.triple_count() >= 0 AS library_loaded;
+SET search_path TO pg_ripple, public;
+
+-- Lowest legal value (GUC range is 100 .. 10000000; default 1000).
+SET pg_ripple.vp_promotion_threshold = 100;
+
+-- Seed p1 with 100 DISTINCT triples; the 100th insert promotes p1 to a
+-- dedicated VP table, so every probe insert below takes the fast path.
+SELECT (SELECT count(*) FROM generate_series(1, 100) i
+        WHERE pg_ripple.insert_triple(
+            'https://val377.test/e' || i,
+            'https://val377.test/p1', '"a"',
+            'https://val377.test/g1') IS NOT NULL) = 100 AS seed_p1_100_distinct;
+-- Guard: p1 must be promoted (dedicated VP table) so the probes below
+-- exercise the upsert fast path, not vp_rare.
+SELECT EXISTS (
+    SELECT 1 FROM _pg_ripple.predicates p
+    JOIN _pg_ripple.dictionary d ON d.id = p.id
+    WHERE d.value = 'https://val377.test/p1' AND p.table_oid IS NOT NULL
+) AS p1_promoted;
+
+-- Fresh DISTINCT triple through the fast path; keep every returned SID.
+-- On 0.140.2 the three re-asserts each returned a newly minted SID.
+CREATE TEMP TABLE val377_sids (call_no int, sid bigint);
+INSERT INTO val377_sids VALUES (0, pg_ripple.insert_triple(
+    'https://val377.test/e0', 'https://val377.test/p1', '"zz"',
+    'https://val377.test/g1'));
+
+-- Snapshot the physical delta row right after the fresh insert: its SID (i)
+-- and its row version (xmin). Each statement below runs in its own
+-- transaction, so on the old DO UPDATE shape every re-assert bumped xmin.
+CREATE TEMP TABLE val377_row (sid bigint, xmin_text text);
+DO $do$
+DECLARE
+    pid  bigint;
+    s_id bigint;
+    o_id bigint;
+    g_id bigint;
+BEGIN
+    SELECT d.id INTO pid  FROM _pg_ripple.dictionary d WHERE d.value = 'https://val377.test/p1';
+    SELECT d.id INTO s_id FROM _pg_ripple.dictionary d WHERE d.value = 'https://val377.test/e0';
+    SELECT d.id INTO o_id FROM _pg_ripple.dictionary d WHERE d.value = 'zz' AND d.kind = 2;
+    SELECT d.id INTO g_id FROM _pg_ripple.dictionary d WHERE d.value = 'https://val377.test/g1';
+    EXECUTE format(
+        'INSERT INTO val377_row SELECT t.i, t.xmin::text FROM _pg_ripple.vp_%s_delta t WHERE t.s = %s AND t.o = %s AND t.g = %s',
+        pid, s_id, o_id, g_id);
+END
+$do$;
+SELECT sid IS NOT NULL AND xmin_text IS NOT NULL AS row_snapshot_taken FROM val377_row;
+
+-- Re-assert the same triple 3 more times through insert_triple.
+INSERT INTO val377_sids
+SELECT n, pg_ripple.insert_triple(
+    'https://val377.test/e0', 'https://val377.test/p1', '"zz"',
+    'https://val377.test/g1')
+FROM generate_series(1, 3) n;
+
+-- A1: all 4 calls (1 fresh + 3 re-asserts) returned the SAME sid.
+SELECT count(DISTINCT sid) = 1 AS sid_stable_across_4_calls FROM val377_sids;
+
+-- A2/A3: the stored row kept its SID and its row version — no rewrite.
+CREATE TEMP TABLE val377_checks (name text, ok boolean);
+DO $do$
+DECLARE
+    pid  bigint;
+    s_id bigint;
+    o_id bigint;
+    g_id bigint;
+BEGIN
+    SELECT d.id INTO pid  FROM _pg_ripple.dictionary d WHERE d.value = 'https://val377.test/p1';
+    SELECT d.id INTO s_id FROM _pg_ripple.dictionary d WHERE d.value = 'https://val377.test/e0';
+    SELECT d.id INTO o_id FROM _pg_ripple.dictionary d WHERE d.value = 'zz' AND d.kind = 2;
+    SELECT d.id INTO g_id FROM _pg_ripple.dictionary d WHERE d.value = 'https://val377.test/g1';
+    EXECUTE format(
+        'INSERT INTO val377_checks SELECT ''i_stable'', t.i = r.sid FROM _pg_ripple.vp_%s_delta t, val377_row r WHERE t.s = %s AND t.o = %s AND t.g = %s',
+        pid, s_id, o_id, g_id);
+    EXECUTE format(
+        'INSERT INTO val377_checks SELECT ''xmin_stable'', t.xmin::text = r.xmin_text FROM _pg_ripple.vp_%s_delta t, val377_row r WHERE t.s = %s AND t.o = %s AND t.g = %s',
+        pid, s_id, o_id, g_id);
+END
+$do$;
+SELECT ok AS stored_i_equals_first_sid FROM val377_checks WHERE name = 'i_stable';
+SELECT ok AS row_version_stable_after_reasserts FROM val377_checks WHERE name = 'xmin_stable';
+
+-- A4: the catalog counter still equals the number of DISTINCT triples (VAL-371
+-- contract preserved by the rewrite).
+SELECT (SELECT p.triple_count FROM _pg_ripple.predicates p
+        JOIN _pg_ripple.dictionary d ON d.id = p.id
+        WHERE d.value = 'https://val377.test/p1') = 101
+    AS p1_counter_101_after_reasserts;
+
+-- Path 2: SPARQL UPDATE executor (insert_triple_by_ids ->
+-- insert_encoded_triple). Re-asserting the same quad twice more must not
+-- move the physical row either.
+SELECT pg_ripple.sparql_update($$
+    INSERT DATA { GRAPH <https://val377.test/g1> {
+        <https://val377.test/e0> <https://val377.test/p1> "zz" } }
+$$) >= 0 AS sparql_reassert_1;
+SELECT pg_ripple.sparql_update($$
+    INSERT DATA { GRAPH <https://val377.test/g1> {
+        <https://val377.test/e0> <https://val377.test/p1> "zz" } }
+$$) >= 0 AS sparql_reassert_2;
+
+DO $do$
+DECLARE
+    pid  bigint;
+    s_id bigint;
+    o_id bigint;
+    g_id bigint;
+BEGIN
+    SELECT d.id INTO pid  FROM _pg_ripple.dictionary d WHERE d.value = 'https://val377.test/p1';
+    SELECT d.id INTO s_id FROM _pg_ripple.dictionary d WHERE d.value = 'https://val377.test/e0';
+    SELECT d.id INTO o_id FROM _pg_ripple.dictionary d WHERE d.value = 'zz' AND d.kind = 2;
+    SELECT d.id INTO g_id FROM _pg_ripple.dictionary d WHERE d.value = 'https://val377.test/g1';
+    EXECUTE format(
+        'INSERT INTO val377_checks SELECT ''xmin_stable_sparql'', t.xmin::text = r.xmin_text FROM _pg_ripple.vp_%s_delta t, val377_row r WHERE t.s = %s AND t.o = %s AND t.g = %s',
+        pid, s_id, o_id, g_id);
+END
+$do$;
+SELECT ok AS sparql_path_row_version_stable FROM val377_checks WHERE name = 'xmin_stable_sparql';
+SELECT (SELECT p.triple_count FROM _pg_ripple.predicates p
+        JOIN _pg_ripple.dictionary d ON d.id = p.id
+        WHERE d.value = 'https://val377.test/p1') = 101
+    AS p1_counter_101_after_sparql_reasserts;
+
+-- Scoped physical total (hermetic): exactly the 101 DISTINCT triples this
+-- test created — the re-asserts added no rows.
+SELECT (SELECT count(*) FROM pg_ripple.sparql($$
+    SELECT ?s ?p ?o WHERE {
+        GRAPH ?g { ?s ?p ?o . FILTER(STRSTARTS(STR(?s), "https://val377.test/")) }
+    }
+  $$)) = 101
+    AS scoped_physical_is_101;
