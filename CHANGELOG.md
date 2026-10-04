@@ -7,6 +7,35 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
 
+## [0.140.2]
+
+Hot-path lock fix: `ensure_catalog()` no longer emits DDL on every `infer()`
+(VAL-374, extension side of the VAL-372 `Lock/relation` incident).
+
+### Fixed
+
+- **`pg_ripple.infer()` took `ACCESS EXCLUSIVE` on
+  `_pg_ripple.predicates` on every call.** `datalog::ensure_catalog()`
+  (`src/datalog/mod.rs`) ran unconditional DDL — `CREATE TABLE IF NOT EXISTS
+  _pg_ripple.rules` / `_pg_ripple.rule_sets` and `ALTER TABLE
+  _pg_ripple.predicates ADD COLUMN IF NOT EXISTS derived, rule_set` — even on
+  a fully-bootstrapped catalog. `ADD COLUMN IF NOT EXISTS` still acquires
+  `ACCESS EXCLUSIVE` when the columns exist, and `CREATE TABLE IF NOT
+  EXISTS` locks the existing relations, so any session holding `ACCESS
+  SHARE` over the catalog (psql analytics, GC scans, backfills) blocked the
+  whole KG write path until it committed: production incident 04/10
+  09:08-09:11 (holder `valorbrain:kg-maint`, `infer` cancelled at 174 s;
+  VAL-372 forensics). A catalog probe (`to_regclass` + `pg_attribute`, the
+  same guard shape the VAL-208 block already used) now short-circuits the
+  function when the catalog is complete — the hot path takes no DDL locks at
+  all; DDL still runs on real bootstrap and on pre-0.131.0 upgrades missing
+  `rules.name` or the `uq_rules_set_name` index, and a failed probe falls
+  through to the DDL path (no new failure mode). Regression:
+  `tests/pg_regress/sql/v0142_ensure_catalog_no_ddl_hot_path.sql` —
+  `infer()` inside an open transaction holds zero `AccessExclusiveLock`s
+  over the catalog relations (on 0.140.1 the count is 1), with a
+  same-session DDL canary proving `pg_locks` visibility.
+
 ## [0.140.1]
 
 Catalog counter integrity fix (VAL-371, cause-root of the VAL-365 drift).
