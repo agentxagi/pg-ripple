@@ -15,11 +15,22 @@ fn encode_literal(sql: String) -> String {
     format!("pg_ripple.encode_term({sql}, 2::int2)")
 }
 
-#[pgrx::pg_extern(schema = "_pg_ripple", immutable, strict, parallel_safe)]
-fn sha1_hex(value: &str) -> String {
-    use sha1::Digest;
+// VAL-358 port note: upstream declares this with an inline
+// `schema = "_pg_ripple"` attribute, which fails pgrx 0.18 SQL generation on
+// our tree ("that schema did not exist"). Our convention for internal-schema
+// functions is a `#[pg_schema]` module, so the wrapper lives in one.
+#[pgrx::pg_schema]
+mod _pg_ripple {
+    use pgrx::prelude::*;
 
-    hex::encode(sha1::Sha1::digest(value.as_bytes()))
+    /// SHA-1 of the lexical form, hex-encoded (SPARQL SHA1() support).
+    /// IMMUTABLE/STRICT/PARALLEL_SAFE so the planner can push it anywhere.
+    #[pg_extern(immutable, strict, parallel_safe)]
+    fn sha1_hex(value: &str) -> String {
+        use sha1::Digest;
+
+        hex::encode(sha1::Sha1::digest(value.as_bytes()))
+    }
 }
 
 /// Translate a string SPARQL built-in function in value context.
