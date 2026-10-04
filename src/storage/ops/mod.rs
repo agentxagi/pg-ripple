@@ -8,9 +8,9 @@
 #[allow(dead_code)]
 pub mod delete;
 // Q15-01: internal API field; kept for public API surface or future extension consumers.
+pub mod describe_object;
 #[allow(dead_code)]
 pub mod insert;
-pub mod describe_object;
 #[allow(dead_code)]
 pub mod merge;
 pub mod scan;
