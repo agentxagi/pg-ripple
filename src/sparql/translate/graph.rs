@@ -130,8 +130,8 @@ pub(crate) fn translate_service_batched(
         Err(e) => {
             federation::record_health(url, false, latency_ms);
             if silent {
-                pgrx::warning!("batch SERVICE {url} failed (returning empty): {e}");
-                return Some(Fragment::zero_rows());
+                pgrx::warning!("batch SERVICE {url} failed (using input solution): {e}");
+                return Some(Fragment::empty());
             }
             pgrx::warning!("batch SERVICE {url} failed, falling back to sequential: {e}");
             None
@@ -147,11 +147,7 @@ pub(crate) fn translate_service(
     silent: bool,
     ctx: &mut Ctx,
 ) -> Fragment {
-    let service_silent_fallback = |_ctx: &mut Ctx| -> Fragment {
-        // SERVICE SILENT must return 0 rows when the endpoint is blocked/unreachable.
-        // Fragment::zero_rows() generates `FROM (SELECT 1 LIMIT 0) AS _zero` → 0 rows.
-        Fragment::zero_rows()
-    };
+    let service_silent_fallback = |_ctx: &mut Ctx| Fragment::empty();
 
     let url = match name {
         NamedNodePattern::NamedNode(nn) => nn.as_str().to_string(),
@@ -338,11 +334,11 @@ pub(crate) fn translate_service(
                 .as_ref()
                 .and_then(|c| c.to_str().ok())
                 .unwrap_or("warning");
-            if silent || on_error_str == "empty" {
+            if silent {
+                pgrx::warning!("SERVICE {url} failed (using input solution): {e}");
+                return service_silent_fallback(ctx);
+            } else if on_error_str == "empty" {
                 pgrx::warning!("SERVICE {url} failed (returning empty): {e}");
-                if silent {
-                    return service_silent_fallback(ctx);
-                }
                 return Fragment::zero_rows();
             } else if on_error_str == "error" {
                 pgrx::error!("SERVICE {url} failed: {e}");

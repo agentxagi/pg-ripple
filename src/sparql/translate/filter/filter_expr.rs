@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use spargebra::algebra::{Expression, Function, GraphPattern};
 
 use super::filter_dispatch::literal_lexical_value;
+use crate::dictionary;
 use crate::sparql::expr;
 use crate::sparql::sqlgen::{Ctx, Fragment};
 
@@ -318,10 +319,6 @@ pub(crate) fn translate_expr(
     }
 }
 
-// v0.56.0 dead-code audit (A-6): expr_as_text_sql is a utility function
-// used for text-comparison filters; suppress until wired into all filter paths.
-// Q15-01: internal API field; kept for public API surface or future extension consumers.
-#[allow(dead_code)]
 pub(crate) fn expr_as_text_sql(
     expr_in: &Expression,
     bindings: &HashMap<String, String>,
@@ -338,6 +335,11 @@ pub(crate) fn expr_as_text_sql(
             let escaped = val.replace('\'', "''");
             Some(format!("'{escaped}'"))
         }
+        Expression::NamedNode(nn) => {
+            let escaped = nn.as_str().replace('\'', "''");
+            Some(format!("'{escaped}'"))
+        }
+        Expression::FunctionCall(Function::Str, args) => expr_as_text_sql(args.first()?, bindings),
         _ => None,
     }
 }
@@ -353,10 +355,7 @@ pub(crate) fn translate_expr_value(
             if let Some(id) = ctx.encode_iri(nn.as_str()) {
                 return Some(id.to_string());
             }
-            let iri = nn.as_str().replace('\'', "''");
-            Some(format!(
-                "(SELECT d.id FROM _pg_ripple.dictionary d WHERE d.value = '{iri}' AND d.kind = 0 LIMIT 1)"
-            ))
+            Some(dictionary::encode(nn.as_str(), dictionary::KIND_IRI).to_string())
         }
         Expression::Literal(lit) => {
             let id = ctx.encode_literal(lit);
@@ -675,6 +674,14 @@ pub(crate) fn translate_comparison_sides(
     bindings: &HashMap<String, String>,
     ctx: &mut Ctx,
 ) -> Option<(String, String)> {
+    if matches!(a, Expression::FunctionCall(Function::Str, _))
+        || matches!(b, Expression::FunctionCall(Function::Str, _))
+    {
+        return Some((
+            expr_as_text_sql(a, bindings)?,
+            expr_as_text_sql(b, bindings)?,
+        ));
+    }
     if expr_is_raw_text(a, ctx) {
         let la = translate_expr_value(a, bindings, ctx)?;
         let ra = match b {

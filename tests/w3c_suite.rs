@@ -4,17 +4,16 @@
 //! project-expression, property-path, service, subquery, syntax-query,
 //! basic-update.
 //!
-//! Runs in parallel (default: 8 threads); target: < 2 minutes on an 8-core runner.
-//! This job is informational (non-blocking) until pass rate reaches 95%.
+//! Runs serially because the cases share one PostgreSQL database.
 //!
 //! # Running locally
 //!
 //! ```sh
 //! # With W3C test data already in tests/w3c/data/:
-//! cargo test --test w3c_suite -- --test-threads 8
+//! cargo test --test w3c_suite -- --nocapture
 //!
 //! # Or point to a custom directory:
-//! W3C_TEST_DIR=/tmp/sparql11 cargo test --test w3c_suite -- --test-threads 8
+//! W3C_TEST_DIR=/tmp/sparql11 cargo test --test w3c_suite -- --nocapture
 //! ```
 //!
 //! Tests skip gracefully when neither the test data nor a pg_ripple database
@@ -49,13 +48,8 @@ fn w3c_suite() {
         .join("w3c")
         .join("known_failures.txt");
 
-    let threads: usize = std::env::var("W3C_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-
     let config = RunConfig {
-        threads,
+        threads: 1,
         timeout_secs: 5,
         categories: vec![
             "aggregates".into(),
@@ -187,8 +181,6 @@ fn w3c_suite() {
         }
     }
 
-    // Full suite is informational — do not fail the test binary on failures.
-    // (Failures are visible in CI via the uploaded report.json artifact.)
     println!(
         "\n  Pass rate: {:.1}%",
         if report.total > 0 {
@@ -198,6 +190,7 @@ fn w3c_suite() {
         }
     );
     println!("  Elapsed: {:.1}s (target: < 120s)", elapsed.as_secs_f32());
+    assert!(report.is_clean(), "{}", report.summary());
 }
 
 /// Write a `report.json` artifact with per-category pass/fail/skip/timeout counts.
@@ -255,7 +248,7 @@ fn write_report_json(report: &w3c::RunReport, config: &RunConfig) {
 
     if let Ok(mut f) = std::fs::File::create(&report_path) {
         if let Ok(s) = to_string_pretty(&doc) {
-            let _ = f.write_all(s.as_bytes());
+            let _ = writeln!(f, "{s}");
             println!("  Report written to {}", report_path.display());
         }
     }
