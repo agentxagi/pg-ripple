@@ -601,6 +601,22 @@ fn execute_add_by_ids(src_g_id: i64, dst_g_id: i64) -> Result<i64, String> {
             let n: i64 = Spi::get_one::<i64>(&insert_sql)
                 .unwrap_or_else(|e| pgrx::error!("ADD vp_rare insert error: {e}"))
                 .unwrap_or(0);
+            // VAL-376: this fourth insert path never maintained the catalog
+            // counter — ADD into a rare predicate inserted rows silently.
+            // With the delete-side fix in place, MOVE/COPY would decrement
+            // the cleared source but the ADD phase had never incremented the
+            // destination, leaving rare predicates under-counted (and
+            // counter-0-with-rows orphans that arm vacuum_vp_rare's broken
+            // non-volatile DELETE). Same real-inserts-only shape as the
+            // dedicated-VP branch above.
+            if n > 0 {
+                Spi::run_with_args(
+                    "UPDATE _pg_ripple.predicates \
+                     SET triple_count = triple_count + $2 WHERE id = $1",
+                    &[DatumWithOid::from(*pred_id), DatumWithOid::from(n)],
+                )
+                .unwrap_or_else(|e| pgrx::error!("ADD vp_rare count update SPI error: {e}"));
+            }
             total += n;
         }
     }

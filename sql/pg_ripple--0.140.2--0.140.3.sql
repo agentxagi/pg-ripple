@@ -1,0 +1,24 @@
+-- Migration 0.140.2 → 0.140.3: mass-cleanup delete paths decrement
+-- triple_count (VAL-376).
+--
+-- Root cause (bisected on the shared regress database): the vp_rare half of
+-- storage::clear_graph_by_id and storage::drop_graph (src/storage/ops/
+-- scan.rs) deleted rows and counted them for the return value but never
+-- decremented _pg_ripple.predicates.triple_count; security_api::
+-- erase_subject (GDPR) and dedup's physical-delete branches had the same
+-- gap. Any CLEAR GRAPH / CLEAR ALL / DROP GRAPH / erase_subject holding
+-- rare predicates left the catalog counting ghosts, and the next re-assert
+-- of the same triple counted as a REAL insert (NOT EXISTS finds nothing),
+-- re-drifting catalog above physical — the delete-side companion of the
+-- VAL-371 insert-side fix. Without this, the VAL-371 one-shot recompute
+-- re-drifts production on every graph cleanup.
+--
+-- Fix (Rust only — scan.rs, security_api.rs, dedup.rs, update.rs):
+--   * the vp_rare branches delete + decrement in a single statement
+--     (WITH d AS (DELETE ... RETURNING p), agg, upd AS (UPDATE
+--     _pg_ripple.predicates SET triple_count = GREATEST(0, ...)));
+--   * erase_subject decrements per delta/main table by the rows removed;
+--   * dedup decrements by the physical duplicates it removes;
+--   * SPARQL ADD's vp_rare branch increments by its real inserts (the
+--     fourth unmaintained path — MOVE/COPY would otherwise decrement a
+--     source graph the ADD phase never incremented).

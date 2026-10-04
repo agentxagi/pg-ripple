@@ -386,9 +386,20 @@ pub(crate) fn erase_subject_impl(iri: &str) -> Vec<EraseRow> {
 
     let mut results: Vec<EraseRow> = Vec::new();
 
-    // Delete from vp_rare.
+    // Delete from vp_rare, decrementing each affected predicate's counter by
+    // the rows actually removed (VAL-376 — same delete-side leak as
+    // clear_graph/drop_graph: erasing a subject used to leave the catalog
+    // counting rows that no longer exist).
     let rare_deleted: i64 = pgrx::Spi::get_one_with_args::<i64>(
-        "WITH d AS (DELETE FROM _pg_ripple.vp_rare WHERE s = $1 RETURNING 1) SELECT count(*)::bigint FROM d",
+        "WITH d AS (DELETE FROM _pg_ripple.vp_rare WHERE s = $1 RETURNING p), \
+             agg AS (SELECT p, count(*) AS cnt FROM d GROUP BY p), \
+             upd AS ( \
+                 UPDATE _pg_ripple.predicates pr \
+                 SET triple_count = GREATEST(0, pr.triple_count - agg.cnt) \
+                 FROM agg WHERE pr.id = agg.p \
+                 RETURNING agg.cnt \
+             ) \
+         SELECT COALESCE(sum(cnt), 0)::bigint FROM upd",
         &[DatumWithOid::from(subject_id)],
     )
     .unwrap_or(None)
@@ -429,6 +440,13 @@ pub(crate) fn erase_subject_impl(iri: &str) -> Vec<EraseRow> {
                 .unwrap_or(None)
                 .unwrap_or(0);
         if delta_cnt > 0 {
+            // VAL-376: keep the catalog in step with the physical rows removed.
+            pgrx::Spi::run_with_args(
+                "UPDATE _pg_ripple.predicates \
+                 SET triple_count = GREATEST(0, triple_count - $2) WHERE id = $1",
+                &[DatumWithOid::from(*pred_id), DatumWithOid::from(delta_cnt)],
+            )
+            .unwrap_or_else(|e| pgrx::warning!("erase_subject delta count update: {e}"));
             results.push(EraseRow {
                 relation: delta_table,
                 rows_deleted: delta_cnt,
@@ -445,6 +463,13 @@ pub(crate) fn erase_subject_impl(iri: &str) -> Vec<EraseRow> {
         {
             let n = cnt.unwrap_or(0);
             if n > 0 {
+                // VAL-376: as above — erased main rows must leave the counter.
+                pgrx::Spi::run_with_args(
+                    "UPDATE _pg_ripple.predicates \
+                     SET triple_count = GREATEST(0, triple_count - $2) WHERE id = $1",
+                    &[DatumWithOid::from(*pred_id), DatumWithOid::from(n)],
+                )
+                .unwrap_or_else(|e| pgrx::warning!("erase_subject main count update: {e}"));
                 results.push(EraseRow {
                     relation: main_table,
                     rows_deleted: n,

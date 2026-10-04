@@ -368,9 +368,24 @@ pub fn clear_graph_by_id(g_id: i64) -> i64 {
         }
     }
 
+    // VAL-376: the vp_rare delete must decrement each affected predicate's
+    // triple_count by the rows actually removed. The old shape counted the
+    // deleted rows for the return value but never touched the catalog, so
+    // CLEAR of a graph holding rare predicates leaked the counter —
+    // re-asserted triples then re-drifted catalog above physical (bisected:
+    // w3c_sparql_update_conformance's CLEAR ALL wiped vp_rare in the shared
+    // regress database and v0141's p3 counter survived with zero rows).
+    // Same defensive GREATEST(0, ...) shape as every other decrement path.
     let d = Spi::get_one_with_args::<i64>(
-        "WITH d AS (DELETE FROM _pg_ripple.vp_rare WHERE g = $1 RETURNING p) \
-         SELECT count(*)::bigint FROM d",
+        "WITH d AS (DELETE FROM _pg_ripple.vp_rare WHERE g = $1 RETURNING p), \
+             agg AS (SELECT p, count(*) AS cnt FROM d GROUP BY p), \
+             upd AS ( \
+                 UPDATE _pg_ripple.predicates pr \
+                 SET triple_count = GREATEST(0, pr.triple_count - agg.cnt) \
+                 FROM agg WHERE pr.id = agg.p \
+                 RETURNING agg.cnt \
+             ) \
+         SELECT COALESCE(sum(cnt), 0)::bigint FROM upd",
         &[DatumWithOid::from(g_id)],
     )
     .unwrap_or_else(|e| pgrx::error!("clear_graph_by_id vp_rare delete SPI error: {e}"))
@@ -494,10 +509,21 @@ pub fn drop_graph(graph_iri: &str) -> i64 {
         }
     }
 
-    // Delete from vp_rare.
+    // Delete from vp_rare — decrementing each affected predicate's counter
+    // by the rows actually removed (VAL-376; same fix as clear_graph_by_id:
+    // the old shape returned the deleted-row count without touching the
+    // catalog, leaking triple_count on every DROP of a graph with rare
+    // predicates).
     let d = Spi::get_one_with_args::<i64>(
-        "WITH d AS (DELETE FROM _pg_ripple.vp_rare WHERE g = $1 RETURNING p) \
-         SELECT count(*)::bigint FROM d",
+        "WITH d AS (DELETE FROM _pg_ripple.vp_rare WHERE g = $1 RETURNING p), \
+             agg AS (SELECT p, count(*) AS cnt FROM d GROUP BY p), \
+             upd AS ( \
+                 UPDATE _pg_ripple.predicates pr \
+                 SET triple_count = GREATEST(0, pr.triple_count - agg.cnt) \
+                 FROM agg WHERE pr.id = agg.p \
+                 RETURNING agg.cnt \
+             ) \
+         SELECT COALESCE(sum(cnt), 0)::bigint FROM upd",
         &[DatumWithOid::from(g_id)],
     )
     .unwrap_or_else(|e| pgrx::error!("drop_graph vp_rare delete SPI error: {e}"))
@@ -905,62 +931,6 @@ pub fn triples_for_subject(subject_id: i64) -> Vec<(i64, i64)> {
             &[DatumWithOid::from(subject_id)],
         )
         .unwrap_or_else(|e| pgrx::error!("describe vp_rare SPI error: {e}"))
-        .filter_map(|row| {
-            Some((
-                row.get::<i64>(1).ok().flatten()?,
-                row.get::<i64>(2).ok().flatten()?,
-            ))
-        })
-        .collect()
-    });
-    result.extend(rare_pairs);
-
-    result
-}
-
-/// Return all `(subject_id, predicate_id)` pairs where the given `object_id`
-/// appears as the object.  Used by the symmetric CBD DESCRIBE algorithm.
-pub fn triples_for_object(object_id: i64) -> Vec<(i64, i64)> {
-    let mut result = Vec::new();
-
-    let pred_ids: Vec<i64> = Spi::connect(|c| {
-        c.select(
-            "SELECT id FROM _pg_ripple.predicates WHERE table_oid IS NOT NULL",
-            None,
-            &[],
-        )
-        .unwrap_or_else(|e| pgrx::error!("describe_incoming predicates SPI error: {e}"))
-        .filter_map(|row| row.get::<i64>(1).ok().flatten())
-        .collect()
-    });
-
-    for p_id in pred_ids {
-        let table = format!("_pg_ripple.vp_{p_id}");
-        let pairs: Vec<(i64, i64)> = Spi::connect(|c| {
-            c.select(
-                &format!("SELECT s, $1 FROM {table} WHERE o = $2"),
-                None,
-                &[DatumWithOid::from(p_id), DatumWithOid::from(object_id)],
-            )
-            .unwrap_or_else(|e| pgrx::error!("describe_incoming vp SPI error: {e}"))
-            .filter_map(|row| {
-                Some((
-                    row.get::<i64>(1).ok().flatten()?,
-                    row.get::<i64>(2).ok().flatten()?,
-                ))
-            })
-            .collect()
-        });
-        result.extend(pairs);
-    }
-
-    let rare_pairs: Vec<(i64, i64)> = Spi::connect(|c| {
-        c.select(
-            "SELECT s, p FROM _pg_ripple.vp_rare WHERE o = $1",
-            None,
-            &[DatumWithOid::from(object_id)],
-        )
-        .unwrap_or_else(|e| pgrx::error!("describe_incoming vp_rare SPI error: {e}"))
         .filter_map(|row| {
             Some((
                 row.get::<i64>(1).ok().flatten()?,

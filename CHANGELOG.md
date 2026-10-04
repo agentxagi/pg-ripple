@@ -7,6 +7,52 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
 
+## [0.140.3]
+
+Delete-side catalog counter fix: mass-cleanup paths that remove `vp_rare`
+rows now decrement `triple_count` (VAL-376, companion of the 0.140.1
+insert-side fix).
+
+### Fixed
+
+- **`CLEAR GRAPH` / `CLEAR ALL` / `DROP GRAPH` leaked
+  `_pg_ripple.predicates.triple_count` for rare predicates.** The `vp_rare`
+  half of `storage::clear_graph_by_id` and `storage::drop_graph`
+  (`src/storage/ops/scan.rs`) deleted rows and counted them for the return
+  value but never told the catalog; the next re-assert of the same triple
+  counted as a real insert (the `NOT EXISTS` guard finds nothing) and
+  re-drifted catalog above physical. Bisected on the shared regress
+  database: `w3c_sparql_update_conformance`'s wholesale CLEAR wipes
+  `vp_rare`, then re-running `v0141_triple_count_reassert.sql` moves its p3
+  counter 1 → 2 with the physical count still at 1. Both functions now
+  delete and decrement per predicate in a single statement
+  (`WITH d AS (DELETE ... RETURNING p), agg, upd AS (UPDATE ...
+  GREATEST(0, triple_count - cnt))`).
+- **`pg_ripple.erase_subject` (GDPR) never maintained counters** — erased
+  rows in `vp_rare`, `vp_*_delta` and `vp_*_main` left the catalog counting
+  ghosts. Each table now decrements by the rows it actually removed.
+- **`pg_ripple.deduplicate` left the catalog counting removed physical
+  duplicates** — the delta and `vp_rare` branches now decrement by the rows
+  they delete.
+- **SPARQL `ADD` into a rare predicate never incremented `triple_count`** —
+  `execute_add_by_ids`'s `vp_rare` branch (`src/sparql/execute/update.rs`)
+  counted real inserts for its return value but skipped the catalog update
+  (only the dedicated-VP branch maintained it). With the delete side fixed,
+  `MOVE`/`COPY` would decrement a cleared source graph that the ADD phase had
+  never incremented, leaving rare predicates under-counted and
+  counter-0-with-rows orphans behind.
+
+### Regression
+
+`tests/pg_regress/sql/v0143_triple_count_delete_sides.sql` (hermetic):
+CLEAR GRAPH on a rare predicate zeroes the counter and a re-load returns it
+to the exact distinct count; `pg_ripple.drop_graph` API; promoted-predicate
+clear control (no double-decrement); `erase_subject`; SPARQL `ADD` coverage;
+namespace-scoped catalog == physical invariant.
+
+No SQL objects change — `pg_ripple--0.140.2--0.140.3.sql` is a version
+marker.
+
 ## [0.140.2]
 
 Hot-path lock fix: `ensure_catalog()` no longer emits DDL on every `infer()`
