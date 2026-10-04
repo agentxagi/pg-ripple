@@ -35,9 +35,19 @@ Catalog counter integrity fix (VAL-371, cause-root of the VAL-365 drift).
   — the same shape already used by Datalog materialisation and SPARQL `ADD`.
   Regression: `tests/pg_regress/sql/v0141_triple_count_reassert.sql`
   (re-assert N× through every patched path → per-predicate counter equals
-  the number of DISTINCT triples; catalog total equals physical any-graph
-  count). No SQL objects change; the production counters are converged by a
-  one-shot recompute in the deploy window, not by this migration.
+  the number of DISTINCT triples; global invariants are asserted HERMETICALLY
+  — post-capture counter delta equals the real inserts only, and a
+  namespace-scoped catalog sum equals the scoped any-graph SPARQL count —
+  because `cargo pgrx regress` runs the whole suite in one shared database
+  where absolute totals cannot hold). No SQL objects change; the production
+  counters are converged by a one-shot recompute in the deploy window, not
+  by this migration.
+
+### Housekeeping
+
+- Version sync for the 0.140.1 bump: `pg_ripple_http/Cargo.toml`,
+  `docker-compose.yml` image tags (both services) and `sbom.json`
+  component version/refs (BUILD-01 + SBOM-04 lints).
 
 
 ## [0.140.0]

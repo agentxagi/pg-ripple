@@ -146,6 +146,20 @@ SELECT (SELECT p.triple_count FROM _pg_ripple.predicates p
  t
 (1 row)
 
+-- ─── G1 capture: global total before the remaining re-assert passes ───────
+-- Everything after this point is a pure re-assert (2× COPY-sub-path re-loads
+-- of the p2 payload + the p3 loads). The global catalog total must not move
+-- by even one row. Captured to a TEMP table because the absolute value is
+-- NOT deterministic: cargo pgrx regress runs the whole suite in one shared
+-- database, so other tests' triples are already counted in triple_count().
+CREATE TEMP TABLE val371_global_before AS
+    SELECT pg_ripple.triple_count() AS n;
+SELECT pg_ripple.triple_count() >= 0 AS g1_capture_point;
+ g1_capture_point 
+------------------
+ t
+(1 row)
+
 -- ─── Path 3b: batch_insert_encoded VP-delta branch (UNNEST/COPY sub-path) ─
 SET pg_ripple.bulk_load_use_copy = on;
 SELECT pg_ripple.load_nquads(
@@ -226,30 +240,54 @@ SELECT (SELECT p.triple_count FROM _pg_ripple.predicates p
  t
 (1 row)
 
--- ─── Global invariant: catalog total == physical any-graph count ──────────
--- p1: 101 + p2: 100 + p3: 1 = 202 distinct triples, all in named graphs;
--- nothing else was loaded (prov_enabled defaults to off, no rules
--- registered, no derivations).
-SELECT pg_ripple.triple_count() = 202 AS catalog_total_202;
- catalog_total_202 
--------------------
+-- ─── Global invariants (HERMETIC) ─────────────────────────────────────────
+-- cargo pgrx regress runs the WHOLE suite in one shared database, so other
+-- tests' triples are already present when this test runs: absolute totals
+-- like `triple_count() = 202` can never hold in the canonical harness (the
+-- first 0.140.1 CI run failed exactly there while every per-predicate
+-- assertion passed). The invariants below are relative or namespace-scoped,
+-- immune to foreign triples on both sides of the comparison.
+-- G1: after the capture point the suite requests 203 more rows (2×100
+-- COPY-batch rows re-asserting the p2 payload + 3 vp_rare loads of the one
+-- p3 triple), but exactly ONE is a real insert (p3's first load). The global
+-- catalog total must move by exactly that 1 — on 0.140.0 logic it moved by
+-- the full 203 requested.
+SELECT (SELECT pg_ripple.triple_count() - n FROM val371_global_before) = 1
+    AS g1_global_total_moves_only_by_real_inserts;
+ g1_global_total_moves_only_by_real_inserts 
+--------------------------------------------
  t
 (1 row)
 
-SELECT (SELECT count(*) FROM pg_ripple.sparql($$
-    SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o . } }
-$$)) = 202 AS physical_anygraph_202;
- physical_anygraph_202 
------------------------
- t
-(1 row)
-
-SELECT pg_ripple.triple_count()
+-- G2: scoped catalog == scoped physical. The catalog side sums triple_count
+-- over THIS test's predicates only; the physical side counts any-graph
+-- SPARQL solutions whose subject belongs to this test's namespace. Both
+-- sides ignore every other test's data: 101 + 100 + 1 = 202 expected.
+SELECT (SELECT COALESCE(SUM(p.triple_count), 0) FROM _pg_ripple.predicates p
+        JOIN _pg_ripple.dictionary d ON d.id = p.id
+        WHERE d.value LIKE 'https://val371.test/%')
     = (SELECT count(*) FROM pg_ripple.sparql($$
-    SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o . } }
-$$)) AS catalog_equals_physical;
- catalog_equals_physical 
--------------------------
+        SELECT ?s ?p ?o WHERE {
+            GRAPH ?g { ?s ?p ?o . FILTER(STRSTARTS(STR(?s), "https://val371.test/")) }
+        }
+      $$))
+    AS g2_scoped_catalog_equals_physical;
+ g2_scoped_catalog_equals_physical 
+-----------------------------------
+ t
+(1 row)
+
+-- G3: the scoped physical count itself is exactly the 202 DISTINCT triples
+-- this test created (101 p1 + 100 p2 + 1 p3) — a positive control that the
+-- G2 filter is not vacuously matching nothing.
+SELECT (SELECT count(*) FROM pg_ripple.sparql($$
+    SELECT ?s ?p ?o WHERE {
+        GRAPH ?g { ?s ?p ?o . FILTER(STRSTARTS(STR(?s), "https://val371.test/")) }
+    }
+  $$)) = 202
+    AS g3_scoped_physical_is_202;
+ g3_scoped_physical_is_202 
+---------------------------
  t
 (1 row)
 
