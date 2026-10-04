@@ -14,9 +14,14 @@
 -- gone (not an empty binding), no vp_rare row references her id in any role,
 -- the caches hold no residue, and the knows predicate counter is back to 0.
 
-SET client_min_messages = warning;
+-- Deterministic library load (v0145 pattern): on a fresh cluster the .so
+-- loads at CREATE EXTENSION; on the shared regress database the extension
+-- already exists, CREATE EXTENSION IF NOT EXISTS is a no-op and the load
+-- happens at the first C call.  Suppress the shared_preload_libraries
+-- advisory wherever it fires and force the load at a fixed position.
+SET client_min_messages TO error;
 CREATE EXTENSION IF NOT EXISTS pg_ripple;
-SET client_min_messages = DEFAULT;
+SELECT pg_ripple.triple_count() >= 0 AS library_loaded;
 SET search_path TO pg_ripple, public;
 
 -- Graph with alice as a subject AND as the object of bob's knows triple.
