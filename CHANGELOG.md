@@ -6,6 +6,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
+## [0.140.4]
+
+Storage hygiene fix: re-asserting an existing triple keeps its statement ID
+and no longer rewrites the delta row (VAL-377).
+
+### Fixed
+
+- **Single-row delta upserts minted a new SID and rewrote the row on every
+  re-assert.** `insert_triple` and `insert_encoded_triple`
+  (`src/storage/ops/mod.rs`) upserted with `ON CONFLICT (s, o, g) DO UPDATE
+  SET i = EXCLUDED.i` while `i` defaults to `nextval()`, so the conflict
+  path overwrote the existing statement ID with a fresh sequence value and
+  physically rewrote the delta row each pass (SID 641→642→643 observed over
+  three re-asserts of one triple). The engine re-asserts heavily
+  (load-ripple.sh, backfill-ripple-sync.ts, entity re-ingest), paying
+  WAL/bloat churn for rows that were already correct, and `insert_triples()`
+  hands SIDs to SQL callers — an identity that must be stable. Both paths
+  now upsert with `ON CONFLICT (s, o, g) DO NOTHING` inside a CTE whose
+  second arm returns the EXISTING row's SID: re-asserts are physical no-ops,
+  callers still receive a valid SID, and the VAL-371 real-insert accounting
+  (`inserted`) is preserved. A concurrent same-triple commit between the
+  statement snapshot and the conflict wait returns zero rows, reported as a
+  duplicate (SID 0) — the same convention as `insert_into_vp_rare`.
+  Regression: `tests/pg_regress/sql/v0144_sid_stable_reassert.sql` — SID
+  stability plus `xmin` non-movement on the physical delta row, for both
+  `insert_triple` (dictionary API) and `insert_encoded_triple` (SPARQL
+  UPDATE INSERT DATA).
 
 ## [0.140.3]
 
