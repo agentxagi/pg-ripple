@@ -9,9 +9,12 @@ use crate::dictionary;
 /// Remove duplicate `(s, o, g)` rows for the predicate identified by `p_iri`.
 ///
 /// Strategy:
-/// - **delta table**: DELETE all rows where ctid is not the minimum ctid per (s,o,g).
-/// - **main table**: insert tombstone rows for all but the minimum-SID row per (s,o,g),
-///   so duplicates are masked at query time and removed on the next merge.
+/// - **delta table**: DELETE all duplicate (s,o,g) rows keeping the minimum-i row.
+/// - **main table**: tombstone each duplicate (s,o,g) group once (existence-guarded)
+///   and re-assert its minimum-SID row into delta, so duplicates are masked at
+///   query time and main collapses to one row on the next merge; the catalog
+///   counters are kept in step and the HTAP view is flipped to the tombstone-
+///   aware form when tombstone_count leaves 0 (VAL-380).
 /// - **vp_rare** (if predicate has no dedicated table): DELETE duplicate rows by
 ///   (p, s, o, g) keeping the minimum ctid.
 ///
@@ -75,29 +78,118 @@ pub fn deduplicate_predicate(p_iri: &str) -> i64 {
 
         total_removed += delta_removed;
 
-        // Deduplicate main: tombstone all but the minimum-SID row per (s,o,g).
-        let main_removed = Spi::get_one_with_args::<i64>(
+        // Deduplicate main: tombstone duplicate (s,o,g) groups so they are
+        // masked at query time and physically collapse on the next merge.
+        //
+        // The tombstone join is on (s, o, g), so one tombstone masks EVERY
+        // main row of the group — including the minimum-SID row that must
+        // survive. This statement therefore also re-asserts that survivor
+        // into delta (explicit i, ON CONFLICT DO NOTHING): the tombstone-
+        // aware view keeps returning exactly one row per group, and the next
+        // merge folds (main − tombstones) ∪ delta into a single physical
+        // row. VAL-380: without the re-assert, flipping the view to the
+        // tombstone-aware form (below) hides the whole group and the next
+        // merge drops it permanently.
+        //
+        // Existence-guarded INSERT: a pre-existing tombstone wins (a real
+        // delete must never be undone by re-asserting a survivor; a prior
+        // dedup run already arranged it), so repeated runs are no-ops.
+        let (main_removed, survivors_kept) = Spi::get_two_with_args::<i64, i64>(
             &format!(
                 "WITH ranked AS ( \
                      SELECT s, o, g, i, \
                             ROW_NUMBER() OVER (PARTITION BY s, o, g ORDER BY i ASC) AS rn \
                      FROM {main} \
                  ), \
-                 dupes AS (SELECT DISTINCT s, o, g FROM ranked WHERE rn > 1), \
-                 ins AS ( \
+                 dup_groups AS ( \
+                     SELECT s, o, g, COUNT(*)::BIGINT AS n \
+                     FROM ranked \
+                     GROUP BY s, o, g \
+                     HAVING COUNT(*) > 1 \
+                 ), \
+                 new_ts AS ( \
                      INSERT INTO {tombs} (s, o, g) \
-                     SELECT s, o, g FROM dupes \
-                     ON CONFLICT DO NOTHING \
+                     SELECT d.s, d.o, d.g FROM dup_groups d \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM {tombs} t \
+                         WHERE t.s = d.s AND t.o = d.o AND t.g = d.g \
+                     ) \
+                     RETURNING s, o, g \
+                 ), \
+                 survivors AS ( \
+                     INSERT INTO {delta} (s, o, g, i) \
+                     SELECT r.s, r.o, r.g, r.i \
+                     FROM ranked r \
+                     JOIN new_ts nt ON r.s = nt.s AND r.o = nt.o AND r.g = nt.g \
+                     WHERE r.rn = 1 \
+                     ON CONFLICT (s, o, g) DO NOTHING \
                      RETURNING 1 \
                  ) \
-                 SELECT COUNT(*)::BIGINT FROM ins"
+                 SELECT \
+                     COALESCE((SELECT SUM(d.n - 1)::BIGINT FROM dup_groups d \
+                               JOIN new_ts nt \
+                                 ON d.s = nt.s AND d.o = nt.o AND d.g = nt.g), 0::BIGINT), \
+                     (SELECT COUNT(*)::BIGINT FROM survivors)"
             ),
             &[],
         )
-        .unwrap_or(None)
-        .unwrap_or(0);
+        .unwrap_or((None, None));
+        let main_removed = main_removed.unwrap_or(0);
+        let survivors_kept = survivors_kept.unwrap_or(0);
+
+        // VAL-376 (same contract as the delta/vp_rare branches): the
+        // tombstoned duplicate rows leave main at the next merge, so they
+        // leave the catalog counter now — catalog, query visibility and
+        // physical stay in lockstep at every point (one logical triple per
+        // deduplicated group from here on; delta holds the survivor).
+        if main_removed > 0 {
+            Spi::run_with_args(
+                "UPDATE _pg_ripple.predicates \
+                 SET triple_count = GREATEST(0, triple_count - $2) WHERE id = $1",
+                &[DatumWithOid::from(p_id), DatumWithOid::from(main_removed)],
+            )
+            .unwrap_or_else(|e| pgrx::error!("dedup main count update SPI error: {e}"));
+        }
 
         total_removed += main_removed;
+
+        // Survivors ride the delta inbox — same bookkeeping as the insert
+        // paths, so reads and the next merge see them (VAL-380).
+        if survivors_kept > 0 {
+            crate::shmem::record_delta_inserts(survivors_kept);
+            crate::shmem::set_predicate_delta_bit(p_id);
+        }
+
+        // VAL-380: tombstones created here must be honoured by the catalog
+        // and the HTAP view immediately — same contract as the clear_graph /
+        // drop_graph / delete main branches (M15-05). The recompute is
+        // absolute (the tombstone table is the source of truth, existence
+        // guard included). When the count leaves 0 the view was in the
+        // tombstone-skip form (no LEFT JOIN) and must be flipped back, or
+        // the new tombstones stay invisible until some other path rebuilds
+        // the view.
+        if main_removed > 0 {
+            let prev_count: i64 = Spi::get_one_with_args::<i64>(
+                "SELECT tombstone_count FROM _pg_ripple.predicates WHERE id = $1",
+                &[DatumWithOid::from(p_id)],
+            )
+            .unwrap_or(None)
+            .unwrap_or(1);
+
+            Spi::run_with_args(
+                &format!(
+                    "UPDATE _pg_ripple.predicates \
+                     SET tombstone_count = (SELECT COUNT(*)::BIGINT FROM {tombs}) \
+                     WHERE id = $1"
+                ),
+                &[DatumWithOid::from(p_id)],
+            )
+            .unwrap_or_else(|e| pgrx::error!("dedup main tombstone_count update SPI error: {e}"));
+
+            if prev_count == 0 {
+                crate::storage::merge::rebuild_htap_view(p_id, true);
+            }
+        }
 
         // ANALYZE both tables.
         Spi::run_with_args(&format!("ANALYZE {delta}"), &[])

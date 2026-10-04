@@ -34,6 +34,42 @@ and no longer rewrites the delta row (VAL-377).
   `insert_triple` (dictionary API) and `insert_encoded_triple` (SPARQL
   UPDATE INSERT DATA).
 
+## [0.140.5]
+
+Dedup main-branch tombstone maintenance: `deduplicate_predicate`'s
+dedicated-tables branch now keeps the catalog and the HTAP view in step with
+the tombstones it creates (VAL-380, follow-up of the 0.140.3 delete-side
+fix). Rebased on the merged 0.140.4 (VAL-377, PRs #21/#22).
+
+### Fixed
+
+- **`pg_ripple.deduplicate_predicate` (main branch) left
+  `_pg_ripple.predicates.tombstone_count` at 0 and never rebuilt the HTAP
+  view out of the tombstone-skip form**, so the tombstones it had just
+  created stayed invisible until some other path (delete, clear, merge)
+  rebuilt the view. Because the tombstone join is on `(s, o, g)`, one
+  tombstone masks every main row of the group — including the minimum-SID
+  row that must survive — so once the view did honour tombstones, a
+  deduplicated group with no delta row vanished from reads and the next
+  merge dropped it permanently (`v0145_dedup_main_tombstones` is red on the
+  #20 base: counter stays 0, view stays in skip form, the re-asserted
+  triple becomes unfindable, `main` ends at 99 of 100 and the scoped
+  catalog-vs-physical invariant fails). The branch now tombstones each
+  duplicate group once (existence-guarded: repeated runs are no-ops, a
+  real delete is never undone), re-asserts the group's minimum-SID row
+  into delta in the same statement (the view keeps returning the triple;
+  the next merge collapses `main` to exactly one physical row), decrements
+  `triple_count` by the removed duplicates (same contract #20 gave the
+  delta/vp_rare branches), and recomputes `tombstone_count` absolutely
+  from the tombstones table, flipping the view to the tombstone-aware
+  form when the count leaves 0 (M15-05 contract).
+- **`pg_ripple.drop_graph` on a dedicated-VP predicate never maintained
+  `tombstone_count` or the HTAP view either** (its sibling
+  `clear_graph_by_id` already did): the dropped main rows kept being
+  served by the tombstone-skip view until some other path rebuilt it.
+  Same M15-05 block applied; exposed and pinned by the cleanup section of
+  the same regression.
+
 ## [0.140.3]
 
 Delete-side catalog counter fix: mass-cleanup paths that remove `vp_rare`
