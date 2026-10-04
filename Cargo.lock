@@ -2088,7 +2088,7 @@ dependencies = [
 
 [[package]]
 name = "pg_ripple"
-version = "0.140.3"
+version = "0.140.4"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "pg_ripple_http"
-version = "0.140.3"
+version = "0.140.4"
 dependencies = [
  "arrow",
  "axum",

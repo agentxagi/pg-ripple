@@ -49,6 +49,51 @@ pub fn next_load_generation() -> i64 {
     new_gen
 }
 
+/// Upsert one pre-encoded triple into a dedicated VP delta table (VAL-377).
+///
+/// `ON CONFLICT (s, o, g) DO NOTHING` keeps an existing row — and its
+/// statement ID — untouched: the previous `DO UPDATE SET i = EXCLUDED.i`
+/// overwrote `i` with a fresh `nextval()` on every re-assert, minting a new
+/// SID (641→642→643 observed in production) and rewriting the row
+/// (WAL/bloat churn) on the hot re-assert paths (load-ripple.sh, backfills,
+/// entity re-ingest). The CTE's second arm still returns the EXISTING row's
+/// SID so callers keep a stable identifier; `inserted` (true only for the
+/// fresh-INSERT arm) keeps the VAL-371 counting rule that only real inserts
+/// may bump triple_count.
+///
+/// If a concurrent transaction commits the same triple between this
+/// statement's snapshot and its conflict wait, both arms return no row and
+/// pgrx surfaces `SpiError::InvalidPosition`; that case is reported as a
+/// duplicate (SID 0) — the same convention as `insert_into_vp_rare`.
+fn upsert_delta_row(delta: &str, s_id: i64, o_id: i64, g: i64, what: &str) -> (i64, bool) {
+    match Spi::get_two_with_args::<i64, bool>(
+        &format!(
+            "WITH ins AS ( \
+                 INSERT INTO {delta} (s, o, g) VALUES ($1, $2, $3) \
+                 ON CONFLICT (s, o, g) DO NOTHING \
+                 RETURNING i, true AS inserted \
+             ) \
+             SELECT i, inserted FROM ins \
+             UNION ALL \
+             SELECT d.i, false FROM {delta} d \
+             WHERE d.s = $1 AND d.o = $2 AND d.g = $3 \
+               AND NOT EXISTS (SELECT 1 FROM ins) \
+             LIMIT 1"
+        ),
+        &[
+            DatumWithOid::from(s_id),
+            DatumWithOid::from(o_id),
+            DatumWithOid::from(g),
+        ],
+    ) {
+        Ok((Some(sid), Some(inserted))) => (sid, inserted),
+        // Not reachable in practice: both returned columns are NOT NULL.
+        Ok(_) => (0, false),
+        Err(pgrx::spi::SpiError::InvalidPosition) => (0, false),
+        Err(e) => pgrx::error!("{what} SPI error: {e}"),
+    }
+}
+
 /// Insert a triple `(s, p, o)` into graph `g`.
 ///
 /// Routes to vp_rare for new/rare predicates; promotes when threshold is crossed.
@@ -68,31 +113,11 @@ pub fn insert_triple(s: &str, p: &str, o: &str, g: i64) -> i64 {
     // Fast path: dedicated VP table (HTAP split) already exists — insert to delta.
     if let Some(_view) = get_dedicated_vp_table(p_id) {
         let delta = format!("_pg_ripple.vp_{p_id}_delta");
-        // Use ON CONFLICT DO UPDATE to get the existing row's ID if it already exists.
-        // This handles UNIQUE (s, o, g) constraint (v0.22.0 H-6).
-        // If the triple already exists in delta, we return its existing statement ID.
-        // This prevents duplicate triples across main+delta merge boundaries.
-        // VAL-371: RETURNING (xmax = 0) tells a real INSERT (fresh row,
-        // xmax = 0) from the conflict path (existing row updated under the
-        // current transaction id, xmax != 0). Only real inserts may bump
-        // triple_count — the previous unconditional +1 inflated the catalog
-        // counter on every re-asserted triple (+23.139 measured in production
-        // on 0.140.0; the SQL side always absorbed the duplicates).
-        let (sid, inserted) = Spi::get_two_with_args::<i64, bool>(
-            &format!(
-                "INSERT INTO {delta} (s, o, g) VALUES ($1, $2, $3) \
-                 ON CONFLICT (s, o, g) DO UPDATE SET i = EXCLUDED.i \
-                 RETURNING i, (xmax = 0) AS inserted"
-            ),
-            &[
-                DatumWithOid::from(s_id),
-                DatumWithOid::from(o_id),
-                DatumWithOid::from(g),
-            ],
-        )
-        .unwrap_or_else(|e| pgrx::error!("triple insert SPI error: {e}"));
-        let sid = sid.unwrap_or(0);
-        let inserted = inserted.unwrap_or(false);
+        // Upsert with set semantics for the UNIQUE (s, o, g) constraint
+        // (v0.22.0 H-6): re-asserting an existing triple returns its
+        // existing SID without rewriting the row (VAL-377); only real
+        // inserts bump triple_count (VAL-371).
+        let (sid, inserted) = upsert_delta_row(&delta, s_id, o_id, g, "triple insert");
 
         if inserted {
             Spi::run_with_args(
@@ -201,24 +226,10 @@ pub fn insert_encoded_triple(s_id: i64, p_id: i64, o_id: i64, g: i64) -> i64 {
     if let Some(_view) = get_dedicated_vp_table(p_id) {
         // Route insert to delta table (HTAP write inbox).
         let delta = format!("_pg_ripple.vp_{p_id}_delta");
-        // Use ON CONFLICT DO UPDATE for UNIQUE (s, o, g) constraint (v0.22.0 H-6).
-        // VAL-371: as in insert_triple — only real inserts (xmax = 0) may
-        // bump triple_count; re-asserted duplicates are no-ops for the counter.
-        let (sid, inserted) = Spi::get_two_with_args::<i64, bool>(
-            &format!(
-                "INSERT INTO {delta} (s, o, g) VALUES ($1, $2, $3) \
-                 ON CONFLICT (s, o, g) DO UPDATE SET i = EXCLUDED.i \
-                 RETURNING i, (xmax = 0) AS inserted"
-            ),
-            &[
-                DatumWithOid::from(s_id),
-                DatumWithOid::from(o_id),
-                DatumWithOid::from(g),
-            ],
-        )
-        .unwrap_or_else(|e| pgrx::error!("bulk insert SPI error: {e}"));
-        let sid = sid.unwrap_or(0);
-        let inserted = inserted.unwrap_or(false);
+        // VAL-377/VAL-371: as in insert_triple — DO NOTHING upsert that
+        // returns the existing SID for re-asserted triples without
+        // rewriting the row; only real inserts bump triple_count.
+        let (sid, inserted) = upsert_delta_row(&delta, s_id, o_id, g, "bulk insert");
 
         if inserted {
             Spi::run_with_args(

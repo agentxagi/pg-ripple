@@ -1,0 +1,33 @@
+-- Migration 0.140.3 → 0.140.4: single-row delta upsert keeps the existing
+-- SID and does not rewrite the row on re-assert (VAL-377).
+--
+-- Root cause (found during VAL-371 delivery, PR #18 review): the single-row
+-- upserts of src/storage/ops/mod.rs (insert_triple and insert_encoded_triple)
+-- used `ON CONFLICT (s, o, g) DO UPDATE SET i = EXCLUDED.i` while `i`
+-- defaults to nextval('_pg_ripple.statement_id_seq'). Re-asserting an
+-- existing triple therefore OVERWROTE its statement ID with a fresh
+-- sequence value and physically rewrote the delta row on every pass
+-- (SID 641→642→643 observed over three re-asserts of the same triple).
+--
+-- Impact:
+--   * SID is not a stable row identity: any future consumer treating the
+--     returned SID as stable would break (insert_triples() exposes SIDs to
+--     SQL callers today).
+--   * WAL/bloat churn: production re-asserts heavily (load-ripple.sh,
+--     backfill-ripple-sync.ts, entity re-ingest), rewriting rows that were
+--     already correct.
+--
+-- Fix (Rust only — src/storage/ops/mod.rs):
+--   * both single-row upserts now use `ON CONFLICT (s, o, g) DO NOTHING`
+--     inside a CTE whose second arm returns the EXISTING row's SID, so
+--     re-asserts are pure no-ops on the physical row while callers still
+--     receive a valid (stable) SID plus the new-vs-existing `inserted` flag
+--     that VAL-371's triple_count accounting relies on;
+--   * a concurrent same-triple insert that commits between the statement
+--     snapshot and the conflict wait yields zero rows; pgrx surfaces that
+--     as SpiError::InvalidPosition, reported as a duplicate (SID 0) — the
+--     same convention as insert_into_vp_rare.
+--
+-- No SQL objects change: this file is a version marker so
+-- ALTER EXTENSION pg_ripple UPDATE TO '0.140.4' can walk the release chain.
+-- Behaviour changes ship in the replacement library binary.
