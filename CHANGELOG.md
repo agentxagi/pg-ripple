@@ -8,6 +8,59 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 ---
 
 
+## [0.140.0]
+
+First selective upstream cherry-pick under
+[ADR-001](docs/adr/ADR-001-fork-independence-trickle-labs.md): port of
+trickle-labs `13aad42c` "Fix W3C SPARQL conformance failures" (VAL-358).
+Version jumps 0.131.0 → 0.140.0 because the 0.132–0.136 numbers were
+double-spent by the upstream line with different content.
+
+### Fixed
+
+- **`FILTER` against a dictionary-absent named node silently dropped every
+  row (FILTER-IRI).** Comparisons like `FILTER(?p != <iri>)` where the
+  constant IRI is not in the dictionary translated to
+  `?p != (SELECT … LIMIT 1)` → `?p != NULL` → NULL, so the filter discarded
+  ALL bindings instead of keeping them (W3C SPARQL §17.4.1.7: `!=` between
+  two distinct terms is true). Reproduced on 0.131.0 with the ValorBrain
+  engine's outgoing/incoming `kg_query` shape
+  (`src/kg-ripple.ts`: `FILTER(?p != <vb:name>)` etc.) on a fresh database
+  — the same failure VAL-201 observed in `valorbrain_test`. The comparison
+  constant now resolves through the deterministic dictionary encoding
+  (`dictionary::encode`), which upserts the term and returns its canonical
+  id: `!=` keeps unmatched rows, `=` matches nothing, and dictionary-resident
+  constants keep the pure-lookup fast path. Pinned by
+  `tests/pg_regress/sql/v0140_sparql_filter_absent_iri.sql`.
+- **Numeric aggregate typing missed the wider integer family
+  (AGG-NUMTYPE).** SUM/AVG/MIN/MAX value decoding and type ranking used
+  per-row dictionary subqueries that only understood
+  decimal/double/float/integer; `xsd:long/int/short/byte` decoded to NULL
+  and unknown datatypes typed as decimal. Aggregates now decode through
+  `pg_ripple.decode_numeric_spi` and rank types through the new
+  `pg_ripple.numeric_type_code_spi(bigint)`.
+- **SPARQL `SHA1()` required pgcrypto (SHA1-NATIVE).** `SHA1()` translated
+  to `digest(…, 'sha1')`, which errors without the pgcrypto extension and
+  is not immutable/parallel-safe. It now maps to the new
+  `_pg_ripple.sha1_hex(text)` (IMMUTABLE, STRICT, PARALLEL SAFE, Rust);
+  SHA384/SHA512 map to PostgreSQL's native `sha384()`/`sha512()`.
+- **`SERVICE SILENT` returned zero rows instead of the input solution
+  (SERVICE-SILENT).** Per W3C SPARQL 1.1 §18.2.4, a failed SILENT SERVICE
+  keeps the incoming solutions; the translator now emits an empty fragment
+  (pass-through) where it previously emitted `SELECT 1 LIMIT 0`.
+- **Property paths bound constant endpoints twice (PATH-CONST).** A path
+  pattern with a constant subject or object also bound that term as a
+  variable in the fragment, producing spurious bindings in the solution.
+
+### Migration
+
+- `sql/pg_ripple--0.131.0--0.140.0.sql` registers
+  `pg_ripple.numeric_type_code_spi(bigint)` and `_pg_ripple.sha1_hex(text)`
+  on existing installs (membership-guarded); fresh installs get both from
+  the generated schema. Verified in place: `ALTER EXTENSION pg_ripple
+  UPDATE` on a 0.131.0 database preserves data and flips the
+  workload repro from 0 rows to the correct 2 rows.
+
 ## [0.131.0]
 
 ### Added
