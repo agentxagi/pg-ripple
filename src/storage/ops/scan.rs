@@ -515,7 +515,7 @@ pub fn drop_graph(graph_iri: &str) -> i64 {
         // and flip the view to the tombstone-aware form when the count
         // leaves 0. Without this, DROP GRAPH leaves the dropped main rows
         // visible in the tombstone-skip view until some other path rebuilds
-        // it — exposed by v0146_dedup_main_tombstones' cleanup section.
+        // it — exposed by v0145_dedup_main_tombstones' cleanup section.
         if d_main > 0 {
             let prev_count: i64 = Spi::get_one_with_args::<i64>(
                 "SELECT tombstone_count FROM _pg_ripple.predicates WHERE id = $1",
