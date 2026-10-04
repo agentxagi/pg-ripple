@@ -62,6 +62,17 @@ pub fn deduplicate_predicate(p_iri: &str) -> i64 {
         .unwrap_or(None)
         .unwrap_or(0);
 
+        // VAL-376: physically removed duplicate rows must leave the catalog
+        // counter too, or dedup repairs the table but re-drifts the catalog.
+        if delta_removed > 0 {
+            Spi::run_with_args(
+                "UPDATE _pg_ripple.predicates \
+                 SET triple_count = GREATEST(0, triple_count - $2) WHERE id = $1",
+                &[DatumWithOid::from(p_id), DatumWithOid::from(delta_removed)],
+            )
+            .unwrap_or_else(|e| pgrx::error!("dedup delta count update SPI error: {e}"));
+        }
+
         total_removed += delta_removed;
 
         // Deduplicate main: tombstone all but the minimum-SID row per (s,o,g).
@@ -111,6 +122,17 @@ pub fn deduplicate_predicate(p_iri: &str) -> i64 {
         )
         .unwrap_or(None)
         .unwrap_or(0);
+
+        // VAL-376: same as the delta branch — removed physical rows must
+        // leave the counter.
+        if rare_removed > 0 {
+            Spi::run_with_args(
+                "UPDATE _pg_ripple.predicates \
+                 SET triple_count = GREATEST(0, triple_count - $2) WHERE id = $1",
+                &[DatumWithOid::from(p_id), DatumWithOid::from(rare_removed)],
+            )
+            .unwrap_or_else(|e| pgrx::error!("dedup vp_rare count update SPI error: {e}"));
+        }
 
         total_removed += rare_removed;
 
