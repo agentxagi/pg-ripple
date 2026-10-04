@@ -1,0 +1,35 @@
+-- Migration 0.140.0 → 0.140.1: catalog triple_count no longer counts
+-- re-asserted duplicates (VAL-371).
+--
+-- Root cause (measured in production on 0.140.0, 04/10/2026):
+-- pg_ripple.triple_count() = SUM(_pg_ripple.predicates.triple_count) ran
+-- +23.139 above the physical/visible triple count (647.255 vs 624.116)
+-- because every insert path incremented the per-predicate counter
+-- unconditionally while the SQL absorbed duplicates:
+--   * insert_triple / insert_encoded_triple single-row upserts did
+--     `triple_count + 1` even when ON CONFLICT (s, o, g) DO UPDATE returned
+--     the EXISTING statement id;
+--   * batch_insert_encoded added rows.len() (the REQUESTED count) on top of
+--     `INSERT ... ON CONFLICT DO NOTHING` (VP-delta branch, both the VALUES
+--     and the UNNEST/bulk_load_use_copy sub-paths) and on top of the
+--     NOT EXISTS-guarded vp_rare batch insert.
+-- Workloads that re-assert triples (load-ripple.sh, backfill-ripple-sync.ts,
+-- entity re-ingestion) inflated the counter on every pass. Deletes were
+-- already correct; the leak was entirely on the insert side.
+--
+-- Fix (Rust only — src/storage/ops/mod.rs):
+--   * single-row upserts now RETURNING i, (xmax = 0) and only count when the
+--     row was actually inserted;
+--   * batch paths now use WITH ins AS (INSERT ... ON CONFLICT DO NOTHING
+--     RETURNING 1) SELECT count(*) — the same shape already used by Datalog
+--     materialisation and SPARQL ADD;
+--   * the Citus direct-shard batch path got the same treatment.
+--
+-- No SQL objects change in this release: this script is a version marker so
+-- `ALTER EXTENSION pg_ripple UPDATE TO '0.140.1'` can walk 0.140.0 → 0.140.1.
+-- The catalog counters themselves are NOT rewritten here: the one-shot
+-- recompute (triple_count = physical count per predicate) runs in the deploy
+-- window as a separate, auditable operation — see the VAL-371 deploy plan.
+-- (Merge workers also converge triple_count to the physical count of the
+-- merged tables, but waiting for organic merges would leave the drift in
+-- place for an unbounded time.)

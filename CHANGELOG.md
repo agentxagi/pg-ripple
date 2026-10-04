@@ -7,6 +7,48 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
 
+## [0.140.1]
+
+Catalog counter integrity fix (VAL-371, cause-root of the VAL-365 drift).
+
+### Fixed
+
+- **Insert paths incremented `triple_count` unconditionally over
+  `ON CONFLICT`.** All insert paths in `src/storage/ops/mod.rs` bumped
+  `_pg_ripple.predicates.triple_count` while the SQL absorbed duplicates:
+  `insert_triple` and `insert_encoded_triple` did `+1` per call even when the
+  single-row upsert returned the EXISTING statement id; `batch_insert_encoded`
+  added `rows.len()` (the requested count) on top of
+  `INSERT … ON CONFLICT DO NOTHING` — VP-delta branch (VALUES and
+  UNNEST/`bulk_load_use_copy` sub-paths) and the `NOT EXISTS`-guarded
+  vp_rare branch; the Citus direct-shard batch path had the same defect.
+  Measured in production on 0.140.0 (04/10/2026):
+  `triple_count()` 647.255 vs 624.116 physical/visible (**+23.139**),
+  concentrated in `rdf:type`, `kg/entityType`, `kg/name`, `related_to`,
+  `depends_on`, `caused_by` + 529 on the vp_rare path — every workload that
+  re-asserts triples (`load-ripple.sh`, `backfill-ripple-sync.ts`, entity
+  re-ingestion) inflated the counter on each pass. Deletes were already
+  correct; the leak was entirely on the insert side.
+  Single-row upserts now `RETURNING i, (xmax = 0)` and count only fresh
+  rows; batch paths use
+  `WITH ins AS (INSERT … ON CONFLICT DO NOTHING RETURNING 1) SELECT count(*)`
+  — the same shape already used by Datalog materialisation and SPARQL `ADD`.
+  Regression: `tests/pg_regress/sql/v0141_triple_count_reassert.sql`
+  (re-assert N× through every patched path → per-predicate counter equals
+  the number of DISTINCT triples; global invariants are asserted HERMETICALLY
+  — post-capture counter delta equals the real inserts only, and a
+  namespace-scoped catalog sum equals the scoped any-graph SPARQL count —
+  because `cargo pgrx regress` runs the whole suite in one shared database
+  where absolute totals cannot hold). No SQL objects change; the production
+  counters are converged by a one-shot recompute in the deploy window, not
+  by this migration.
+
+### Housekeeping
+
+- Version sync for the 0.140.1 bump: `pg_ripple_http/Cargo.toml`,
+  `docker-compose.yml` image tags (both services) and `sbom.json`
+  component version/refs (BUILD-01 + SBOM-04 lints).
+
 
 ## [0.140.0]
 

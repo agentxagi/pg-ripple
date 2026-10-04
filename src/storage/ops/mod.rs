@@ -70,11 +70,17 @@ pub fn insert_triple(s: &str, p: &str, o: &str, g: i64) -> i64 {
         // This handles UNIQUE (s, o, g) constraint (v0.22.0 H-6).
         // If the triple already exists in delta, we return its existing statement ID.
         // This prevents duplicate triples across main+delta merge boundaries.
-        let sid = Spi::get_one_with_args::<i64>(
+        // VAL-371: RETURNING (xmax = 0) tells a real INSERT (fresh row,
+        // xmax = 0) from the conflict path (existing row updated under the
+        // current transaction id, xmax != 0). Only real inserts may bump
+        // triple_count — the previous unconditional +1 inflated the catalog
+        // counter on every re-asserted triple (+23.139 measured in production
+        // on 0.140.0; the SQL side always absorbed the duplicates).
+        let (sid, inserted) = Spi::get_two_with_args::<i64, bool>(
             &format!(
                 "INSERT INTO {delta} (s, o, g) VALUES ($1, $2, $3) \
                  ON CONFLICT (s, o, g) DO UPDATE SET i = EXCLUDED.i \
-                 RETURNING i"
+                 RETURNING i, (xmax = 0) AS inserted"
             ),
             &[
                 DatumWithOid::from(s_id),
@@ -82,17 +88,20 @@ pub fn insert_triple(s: &str, p: &str, o: &str, g: i64) -> i64 {
                 DatumWithOid::from(g),
             ],
         )
-        .unwrap_or_else(|e| pgrx::error!("triple insert SPI error: {e}"))
-        .unwrap_or(0);
+        .unwrap_or_else(|e| pgrx::error!("triple insert SPI error: {e}"));
+        let sid = sid.unwrap_or(0);
+        let inserted = inserted.unwrap_or(false);
 
-        Spi::run_with_args(
-            "UPDATE _pg_ripple.predicates SET triple_count = triple_count + 1 WHERE id = $1",
-            &[DatumWithOid::from(p_id)],
-        )
-        .unwrap_or_else(|e| pgrx::error!("predicate count update SPI error: {e}"));
+        if inserted {
+            Spi::run_with_args(
+                "UPDATE _pg_ripple.predicates SET triple_count = triple_count + 1 WHERE id = $1",
+                &[DatumWithOid::from(p_id)],
+            )
+            .unwrap_or_else(|e| pgrx::error!("predicate count update SPI error: {e}"));
 
-        // Update shmem delta counter for merge worker triggering.
-        crate::shmem::record_delta_inserts(1);
+            // Update shmem delta counter for merge worker triggering.
+            crate::shmem::record_delta_inserts(1);
+        }
         // Mark predicate as having delta rows in the bloom filter.
         crate::shmem::set_predicate_delta_bit(p_id);
 
@@ -191,11 +200,13 @@ pub fn insert_encoded_triple(s_id: i64, p_id: i64, o_id: i64, g: i64) -> i64 {
         // Route insert to delta table (HTAP write inbox).
         let delta = format!("_pg_ripple.vp_{p_id}_delta");
         // Use ON CONFLICT DO UPDATE for UNIQUE (s, o, g) constraint (v0.22.0 H-6).
-        let sid = Spi::get_one_with_args::<i64>(
+        // VAL-371: as in insert_triple — only real inserts (xmax = 0) may
+        // bump triple_count; re-asserted duplicates are no-ops for the counter.
+        let (sid, inserted) = Spi::get_two_with_args::<i64, bool>(
             &format!(
                 "INSERT INTO {delta} (s, o, g) VALUES ($1, $2, $3) \
                  ON CONFLICT (s, o, g) DO UPDATE SET i = EXCLUDED.i \
-                 RETURNING i"
+                 RETURNING i, (xmax = 0) AS inserted"
             ),
             &[
                 DatumWithOid::from(s_id),
@@ -203,16 +214,19 @@ pub fn insert_encoded_triple(s_id: i64, p_id: i64, o_id: i64, g: i64) -> i64 {
                 DatumWithOid::from(g),
             ],
         )
-        .unwrap_or_else(|e| pgrx::error!("bulk insert SPI error: {e}"))
-        .unwrap_or(0);
+        .unwrap_or_else(|e| pgrx::error!("bulk insert SPI error: {e}"));
+        let sid = sid.unwrap_or(0);
+        let inserted = inserted.unwrap_or(false);
 
-        Spi::run_with_args(
-            "UPDATE _pg_ripple.predicates SET triple_count = triple_count + 1 WHERE id = $1",
-            &[DatumWithOid::from(p_id)],
-        )
-        .unwrap_or_else(|e| pgrx::error!("predicate count update SPI error: {e}"));
+        if inserted {
+            Spi::run_with_args(
+                "UPDATE _pg_ripple.predicates SET triple_count = triple_count + 1 WHERE id = $1",
+                &[DatumWithOid::from(p_id)],
+            )
+            .unwrap_or_else(|e| pgrx::error!("predicate count update SPI error: {e}"));
 
-        crate::shmem::record_delta_inserts(1);
+            crate::shmem::record_delta_inserts(1);
+        }
         // Mark predicate as having delta rows in the bloom filter.
         crate::shmem::set_predicate_delta_bit(p_id);
         return sid;
@@ -233,19 +247,25 @@ pub fn insert_encoded_triple(s_id: i64, p_id: i64, o_id: i64, g: i64) -> i64 {
 /// avoids per-row string formatting and benefits from plan caching.
 ///
 /// Used by bulk_load, R2RML, and CDC paths.
-pub(crate) fn copy_into_vp(delta: &str, rows: &[(i64, i64, i64)]) {
+///
+/// VAL-371: returns the number of rows ACTUALLY inserted — duplicates
+/// absorbed by ON CONFLICT DO NOTHING are not counted.
+pub(crate) fn copy_into_vp(delta: &str, rows: &[(i64, i64, i64)]) -> i64 {
     if rows.is_empty() {
-        return;
+        return 0;
     }
     let s_ids: Vec<i64> = rows.iter().map(|&(s, _, _)| s).collect();
     let o_ids: Vec<i64> = rows.iter().map(|&(_, o, _)| o).collect();
     let g_ids: Vec<i64> = rows.iter().map(|&(_, _, g)| g).collect();
+    // VAL-371: count real inserts instead of trusting rows.len().
     let sql = format!(
-        "INSERT INTO {delta} (s, o, g) \
-         SELECT s, o, g FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[]) AS t(s, o, g) \
-         ON CONFLICT (s, o, g) DO NOTHING"
+        "WITH ins AS ( \
+             INSERT INTO {delta} (s, o, g) \
+             SELECT s, o, g FROM UNNEST($1::bigint[], $2::bigint[], $3::bigint[]) AS t(s, o, g) \
+             ON CONFLICT (s, o, g) DO NOTHING RETURNING 1 \
+         ) SELECT count(*)::bigint FROM ins"
     );
-    Spi::run_with_args(
+    Spi::get_one_with_args::<i64>(
         &sql,
         &[
             DatumWithOid::from(s_ids.as_slice()),
@@ -253,7 +273,8 @@ pub(crate) fn copy_into_vp(delta: &str, rows: &[(i64, i64, i64)]) {
             DatumWithOid::from(g_ids.as_slice()),
         ],
     )
-    .unwrap_or_else(|e| pgrx::error!("copy_into_vp: UNNEST insert error: {e}"));
+    .unwrap_or_else(|e| pgrx::error!("copy_into_vp: UNNEST insert error: {e}"))
+    .unwrap_or(0)
 }
 
 /// Records unique graph IDs in the mutation journal so that CWB writeback fires
@@ -272,31 +293,38 @@ pub(crate) fn batch_insert_encoded(p_id: i64, rows: &[(i64, i64, i64)]) -> i64 {
         // Route batch insert to delta table.
         let delta = format!("_pg_ripple.vp_{p_id}_delta");
 
-        if crate::BULK_LOAD_USE_COPY.get() {
+        let cnt = if crate::BULK_LOAD_USE_COPY.get() {
             // H15-05 (v0.94.0): COPY-style path via UNNEST arrays.
-            copy_into_vp(&delta, rows);
+            copy_into_vp(&delta, rows)
         } else {
             // Build a multi-row VALUES insert (all i64 integers — injection-safe).
             let values: Vec<String> = rows
                 .iter()
                 .map(|(s, o, g)| format!("({},{},{})", s, o, g))
                 .collect();
+            // VAL-371: count rows actually inserted, not rows requested —
+            // re-asserted batches used to inflate triple_count by rows.len().
             let sql = format!(
-                "INSERT INTO {delta} (s, o, g) VALUES {} ON CONFLICT (s, o, g) DO NOTHING",
+                "WITH ins AS ( \
+                     INSERT INTO {delta} (s, o, g) VALUES {} \
+                     ON CONFLICT (s, o, g) DO NOTHING RETURNING 1 \
+                 ) SELECT count(*)::bigint FROM ins",
                 values.join(","),
             );
-            Spi::run_with_args(&sql, &[])
-                .unwrap_or_else(|e| pgrx::error!("batch VP delta insert SPI error: {e}"));
+            Spi::get_one_with_args::<i64>(&sql, &[])
+                .unwrap_or_else(|e| pgrx::error!("batch VP delta insert SPI error: {e}"))
+                .unwrap_or(0)
+        };
+
+        if cnt > 0 {
+            Spi::run_with_args(
+                "UPDATE _pg_ripple.predicates SET triple_count = triple_count + $2 WHERE id = $1",
+                &[DatumWithOid::from(p_id), DatumWithOid::from(cnt)],
+            )
+            .unwrap_or_else(|e| pgrx::error!("predicate count batch update SPI error: {e}"));
+
+            crate::shmem::record_delta_inserts(cnt);
         }
-
-        let cnt = rows.len() as i64;
-        Spi::run_with_args(
-            "UPDATE _pg_ripple.predicates SET triple_count = triple_count + $2 WHERE id = $1",
-            &[DatumWithOid::from(p_id), DatumWithOid::from(cnt)],
-        )
-        .unwrap_or_else(|e| pgrx::error!("predicate count batch update SPI error: {e}"));
-
-        crate::shmem::record_delta_inserts(cnt);
         // Mark predicate as having delta rows in the bloom filter.
         crate::shmem::set_predicate_delta_bit(p_id);
     } else {
@@ -317,24 +345,34 @@ pub(crate) fn batch_insert_encoded(p_id: i64, rows: &[(i64, i64, i64)]) -> i64 {
             .iter()
             .map(|(s, o, g)| format!("({},{},{},{})", p_id, s, o, g))
             .collect();
+        // VAL-371: count only rows actually inserted. The previous code added
+        // rows.len() — the REQUESTED count — so every re-asserted batch
+        // inflated triple_count even though NOT EXISTS + UNIQUE absorbed the
+        // duplicates (+529 measured drift on this path in production).
         let sql = format!(
-            "INSERT INTO _pg_ripple.vp_rare (p, s, o, g) \
-             SELECT p, s, o, g FROM (VALUES {}) AS v(p, s, o, g) \
-             WHERE NOT EXISTS (SELECT 1 FROM _pg_ripple.vp_rare r WHERE r.p=v.p AND r.s=v.s AND r.o=v.o AND r.g=v.g)",
+            "WITH ins AS ( \
+                 INSERT INTO _pg_ripple.vp_rare (p, s, o, g) \
+                 SELECT p, s, o, g FROM (VALUES {}) AS v(p, s, o, g) \
+                 WHERE NOT EXISTS (SELECT 1 FROM _pg_ripple.vp_rare r \
+                     WHERE r.p=v.p AND r.s=v.s AND r.o=v.o AND r.g=v.g) \
+                 ON CONFLICT DO NOTHING RETURNING 1 \
+             ) SELECT count(*)::bigint FROM ins",
             values.join(",")
         );
-        Spi::run_with_args(&sql, &[])
-            .unwrap_or_else(|e| pgrx::error!("batch vp_rare insert SPI error: {e}"));
+        let cnt = Spi::get_one_with_args::<i64>(&sql, &[])
+            .unwrap_or_else(|e| pgrx::error!("batch vp_rare insert SPI error: {e}"))
+            .unwrap_or(0);
 
-        let cnt = rows.len() as i64;
-        Spi::run_with_args(
-            "INSERT INTO _pg_ripple.predicates (id, table_oid, triple_count) \
-             VALUES ($1, NULL, $2) \
-             ON CONFLICT (id) DO UPDATE \
-             SET triple_count = _pg_ripple.predicates.triple_count + EXCLUDED.triple_count",
-            &[DatumWithOid::from(p_id), DatumWithOid::from(cnt)],
-        )
-        .unwrap_or_else(|e| pgrx::error!("predicate count batch upsert SPI error: {e}"));
+        if cnt > 0 {
+            Spi::run_with_args(
+                "INSERT INTO _pg_ripple.predicates (id, table_oid, triple_count) \
+                 VALUES ($1, NULL, $2) \
+                 ON CONFLICT (id) DO UPDATE \
+                 SET triple_count = _pg_ripple.predicates.triple_count + EXCLUDED.triple_count",
+                &[DatumWithOid::from(p_id), DatumWithOid::from(cnt)],
+            )
+            .unwrap_or_else(|e| pgrx::error!("predicate count batch upsert SPI error: {e}"));
+        }
     }
 
     // BULK-01: record unique graph IDs in the mutation journal so CWB
@@ -424,30 +462,40 @@ pub fn batch_insert_encoded_shard_direct(p_id: i64, rows: &[(i64, i64, i64)]) ->
             .iter()
             .map(|(s, o, g)| format!("({},{},{})", s, o, g))
             .collect();
+        // VAL-371: count rows actually inserted per shard (same fix as the
+        // coordinator batch path — duplicates absorbed by ON CONFLICT are free).
         let sql = format!(
-            "INSERT INTO {shard_table} (s, o, g) VALUES {} ON CONFLICT (s, o, g) DO NOTHING",
+            "WITH ins AS ( \
+                 INSERT INTO {shard_table} (s, o, g) VALUES {} \
+                 ON CONFLICT (s, o, g) DO NOTHING RETURNING 1 \
+             ) SELECT count(*)::bigint FROM ins",
             values.join(","),
         );
-        if let Err(e) = Spi::run_with_args(&sql, &[]) {
-            pgrx::warning!("direct-shard insert failed for shard {shard_id} (falling back): {e}");
-            // Fall back individual rows via coordinator.
-            batch_insert_encoded(p_id, shard_rows);
-        } else {
-            total += shard_rows.len() as i64;
+        match Spi::get_one_with_args::<i64>(&sql, &[]) {
+            Err(e) => {
+                pgrx::warning!(
+                    "direct-shard insert failed for shard {shard_id} (falling back): {e}"
+                );
+                // Fall back individual rows via coordinator.
+                batch_insert_encoded(p_id, shard_rows);
+            }
+            Ok(n) => total += n.unwrap_or(0),
         }
     }
 
-    // Update predicate counter once for the whole batch.
-    Spi::run_with_args(
-        "UPDATE _pg_ripple.predicates SET triple_count = triple_count + $2 WHERE id = $1",
-        &[
-            pgrx::datum::DatumWithOid::from(p_id),
-            pgrx::datum::DatumWithOid::from(total),
-        ],
-    )
-    .unwrap_or_else(|e| pgrx::error!("predicate count batch update SPI error: {e}"));
+    if total > 0 {
+        // Update predicate counter once for the whole batch.
+        Spi::run_with_args(
+            "UPDATE _pg_ripple.predicates SET triple_count = triple_count + $2 WHERE id = $1",
+            &[
+                pgrx::datum::DatumWithOid::from(p_id),
+                pgrx::datum::DatumWithOid::from(total),
+            ],
+        )
+        .unwrap_or_else(|e| pgrx::error!("predicate count batch update SPI error: {e}"));
 
-    crate::shmem::record_delta_inserts(total);
+        crate::shmem::record_delta_inserts(total);
+    }
     crate::shmem::set_predicate_delta_bit(p_id);
     total
 }
