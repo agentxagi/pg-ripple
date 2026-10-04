@@ -89,7 +89,7 @@ fn upsert_delta_row(delta: &str, s_id: i64, o_id: i64, g: i64, what: &str) -> (i
         Ok((Some(sid), Some(inserted))) => (sid, inserted),
         // Not reachable in practice: both returned columns are NOT NULL.
         Ok(_) => (0, false),
-        Err(e) if matches!(e, pgrx::spi::SpiError::InvalidPosition) => (0, false),
+        Err(pgrx::spi::SpiError::InvalidPosition) => (0, false),
         Err(e) => pgrx::error!("{what} SPI error: {e}"),
     }
 }

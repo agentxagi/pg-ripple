@@ -27,14 +27,17 @@
 -- SPARQL UPDATE INSERT DATA (mutation journal → insert_triple_by_ids).
 -- Everything lives in the https://val377.test/ namespace so the scoped
 -- invariants are immune to foreign triples in the shared regress database.
-
 CREATE EXTENSION IF NOT EXISTS pg_ripple;
 SELECT pg_ripple.triple_count() >= 0 AS library_loaded;
-SET search_path TO pg_ripple, public;
+WARNING:  pg_ripple: loaded without shared_preload_libraries; HTAP merge worker, CONSTRUCT writeback, and dictionary cache are disabled. Add pg_ripple to shared_preload_libraries in postgresql.conf.
+ library_loaded 
+----------------
+ t
+(1 row)
 
+SET search_path TO pg_ripple, public;
 -- Lowest legal value (GUC range is 100 .. 10000000; default 1000).
 SET pg_ripple.vp_promotion_threshold = 100;
-
 -- ─── Path 1: insert_triple single-row upsert (dictionary API) ────────────
 -- 100 DISTINCT single inserts cross the promotion threshold on the last one.
 SELECT (SELECT count(*) FROM generate_series(1, 100) i
@@ -42,6 +45,11 @@ SELECT (SELECT count(*) FROM generate_series(1, 100) i
             'https://val377.test/e' || i,
             'https://val377.test/p1', 'https://val377.test/o' || i,
             'https://val377.test/g1') IS NOT NULL) = 100 AS seed_p1_100_distinct;
+ seed_p1_100_distinct 
+----------------------
+ t
+(1 row)
+
 -- Guard: p1 must be promoted (dedicated VP table) so the probed inserts
 -- below exercise the delta upsert fast path, not vp_rare.
 SELECT EXISTS (
@@ -49,6 +57,11 @@ SELECT EXISTS (
     JOIN _pg_ripple.dictionary d ON d.id = p.id
     WHERE d.value = 'https://val377.test/p1' AND p.table_oid IS NOT NULL
 ) AS p1_promoted;
+ p1_promoted 
+-------------
+ t
+(1 row)
+
 -- One more DISTINCT triple through the fast path; capture its SID.
 SELECT pg_ripple.insert_triple(
     'https://val377.test/e0', 'https://val377.test/p1',
@@ -60,6 +73,11 @@ WHERE d.value = 'https://val377.test/p1' \gset
 CREATE TEMP TABLE val377_p1_row_before AS
     SELECT i AS sid, xmin::text AS row_xmin FROM _pg_ripple.:p1_delta WHERE i = :p1_sid;
 SELECT (SELECT count(*) FROM val377_p1_row_before) = 1 AS p1_row_present;
+ p1_row_present 
+----------------
+ t
+(1 row)
+
 -- Re-assert the same triple 5 more times (0.140.3 minted a fresh SID on
 -- every one of these calls).
 SELECT (SELECT count(*) FROM generate_series(1, 5) n
@@ -67,17 +85,31 @@ SELECT (SELECT count(*) FROM generate_series(1, 5) n
             'https://val377.test/e0', 'https://val377.test/p1',
             'https://val377.test/o0', 'https://val377.test/g1') = :p1_sid) = 5
     AS p1_reassert_returns_same_sid_5x;
+ p1_reassert_returns_same_sid_5x 
+---------------------------------
+ t
+(1 row)
+
 -- Physical proof: same SID still present AND xmin unchanged ⇒ the row was
 -- never rewritten (no new tuple version, no WAL churn).
 SELECT (SELECT count(*) FROM _pg_ripple.:p1_delta WHERE i = :p1_sid) = 1
    AND (SELECT xmin::text FROM _pg_ripple.:p1_delta WHERE i = :p1_sid)
         = (SELECT row_xmin FROM val377_p1_row_before)
     AS p1_row_not_rewritten;
+ p1_row_not_rewritten 
+----------------------
+ t
+(1 row)
+
 -- Counter still counts DISTINCT triples only (VAL-371 invariant kept).
 SELECT (SELECT p.triple_count FROM _pg_ripple.predicates p
         JOIN _pg_ripple.dictionary d ON d.id = p.id
         WHERE d.value = 'https://val377.test/p1') = 101
     AS p1_counter_101_after_reasserts;
+ p1_counter_101_after_reasserts 
+--------------------------------
+ t
+(1 row)
 
 -- ─── Path 2: insert_encoded_triple (SPARQL UPDATE INSERT DATA) ───────────
 -- p2: 100 DISTINCT triples in one load_nquads batch; end-of-load promotion
@@ -87,17 +119,32 @@ SELECT pg_ripple.load_nquads(
         '<https://val377.test/f%s> <https://val377.test/p2> "x" <https://val377.test/g2> .', i),
         E'\n')
      FROM generate_series(1, 100) i), false) = 100 AS p2_load_100_distinct;
+ p2_load_100_distinct 
+----------------------
+ t
+(1 row)
+
 SELECT EXISTS (
     SELECT 1 FROM _pg_ripple.predicates p
     JOIN _pg_ripple.dictionary d ON d.id = p.id
     WHERE d.value = 'https://val377.test/p2' AND p.table_oid IS NOT NULL
 ) AS p2_promoted;
+ p2_promoted 
+-------------
+ t
+(1 row)
+
 -- One DISTINCT triple through the SPARQL UPDATE path (no pre-existence
 -- check: every quad reaches insert_triple_by_ids → insert_encoded_triple).
 SELECT pg_ripple.sparql_update(
     'INSERT DATA { GRAPH <https://val377.test/g2> {
         <https://val377.test/s2> <https://val377.test/p2> "zz" } }'
 ) = 1 AS p2_insert_data_distinct;
+ p2_insert_data_distinct 
+-------------------------
+ t
+(1 row)
+
 SELECT 'vp_' || p.id || '_delta' AS p2_delta
 FROM _pg_ripple.predicates p
 JOIN _pg_ripple.dictionary d ON d.id = p.id
@@ -108,20 +155,40 @@ SELECT max(i) AS p2_sid FROM _pg_ripple.:p2_delta \gset
 CREATE TEMP TABLE val377_p2_row_before AS
     SELECT i AS sid, xmin::text AS row_xmin FROM _pg_ripple.:p2_delta WHERE i = :p2_sid;
 SELECT (SELECT count(*) FROM val377_p2_row_before) = 1 AS p2_row_present;
+ p2_row_present 
+----------------
+ t
+(1 row)
+
 -- Re-execute the SAME INSERT DATA three times (0.140.3 rewrote the row —
 -- and its `i` — on every execution).
 SELECT pg_ripple.sparql_update(
     'INSERT DATA { GRAPH <https://val377.test/g2> {
         <https://val377.test/s2> <https://val377.test/p2> "zz" } }'
 ) = 1 AS p2_reassert_1;
+ p2_reassert_1 
+---------------
+ t
+(1 row)
+
 SELECT pg_ripple.sparql_update(
     'INSERT DATA { GRAPH <https://val377.test/g2> {
         <https://val377.test/s2> <https://val377.test/p2> "zz" } }'
 ) = 1 AS p2_reassert_2;
+ p2_reassert_2 
+---------------
+ t
+(1 row)
+
 SELECT pg_ripple.sparql_update(
     'INSERT DATA { GRAPH <https://val377.test/g2> {
         <https://val377.test/s2> <https://val377.test/p2> "zz" } }'
 ) = 1 AS p2_reassert_3;
+ p2_reassert_3 
+---------------
+ t
+(1 row)
+
 -- Physical proof: row still carries the captured SID with unchanged xmin,
 -- and the table still holds exactly the 101 DISTINCT triples (no duplicate
 -- row with a re-minted SID was left behind).
@@ -130,10 +197,19 @@ SELECT (SELECT count(*) FROM _pg_ripple.:p2_delta WHERE i = :p2_sid) = 1
         = (SELECT row_xmin FROM val377_p2_row_before)
    AND (SELECT count(*) FROM _pg_ripple.:p2_delta) = 101
     AS p2_row_not_rewritten_and_table_still_101;
+ p2_row_not_rewritten_and_table_still_101 
+------------------------------------------
+ t
+(1 row)
+
 SELECT (SELECT p.triple_count FROM _pg_ripple.predicates p
         JOIN _pg_ripple.dictionary d ON d.id = p.id
         WHERE d.value = 'https://val377.test/p2') = 101
     AS p2_counter_101_after_reasserts;
+ p2_counter_101_after_reasserts 
+--------------------------------
+ t
+(1 row)
 
 -- ─── Global invariants (HERMETIC) ─────────────────────────────────────────
 -- cargo pgrx regress runs the WHOLE suite in one shared database, so other
@@ -148,6 +224,11 @@ SELECT (SELECT COALESCE(SUM(p.triple_count), 0) FROM _pg_ripple.predicates p
         }
       $$))
     AS g1_scoped_catalog_equals_physical;
+ g1_scoped_catalog_equals_physical 
+-----------------------------------
+ t
+(1 row)
+
 -- Positive control: the scoped physical count is exactly the 202 DISTINCT
 -- triples this test created (101 p1 + 101 p2).
 SELECT (SELECT count(*) FROM pg_ripple.sparql($$
@@ -156,3 +237,8 @@ SELECT (SELECT count(*) FROM pg_ripple.sparql($$
     }
   $$)) = 202
     AS g2_scoped_physical_is_202;
+ g2_scoped_physical_is_202 
+---------------------------
+ t
+(1 row)
+
