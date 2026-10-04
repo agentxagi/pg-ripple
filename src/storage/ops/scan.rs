@@ -507,6 +507,37 @@ pub fn drop_graph(graph_iri: &str) -> i64 {
             .unwrap_or_else(|e| pgrx::error!("predicate count update SPI error: {e}"));
             deleted += d;
         }
+
+        // M15-05 (v0.96.0) / VAL-380: tombstones added here must be honoured
+        // by the catalog and the HTAP view immediately, exactly like
+        // clear_graph_by_id's dedicated branch: update tombstone_count
+        // (absolute recompute — the INSERT above is not existence-guarded)
+        // and flip the view to the tombstone-aware form when the count
+        // leaves 0. Without this, DROP GRAPH leaves the dropped main rows
+        // visible in the tombstone-skip view until some other path rebuilds
+        // it — exposed by v0145_dedup_main_tombstones' cleanup section.
+        if d_main > 0 {
+            let prev_count: i64 = Spi::get_one_with_args::<i64>(
+                "SELECT tombstone_count FROM _pg_ripple.predicates WHERE id = $1",
+                &[DatumWithOid::from(p_id)],
+            )
+            .unwrap_or(None)
+            .unwrap_or(1);
+
+            Spi::run_with_args(
+                &format!(
+                    "UPDATE _pg_ripple.predicates \
+                     SET tombstone_count = (SELECT COUNT(*)::BIGINT FROM {tombs}) \
+                     WHERE id = $1"
+                ),
+                &[DatumWithOid::from(p_id)],
+            )
+            .unwrap_or_else(|e| pgrx::error!("drop_graph tombstone_count update SPI error: {e}"));
+
+            if prev_count == 0 {
+                crate::storage::merge::rebuild_htap_view(p_id, true);
+            }
+        }
     }
 
     // Delete from vp_rare — decrementing each affected predicate's counter

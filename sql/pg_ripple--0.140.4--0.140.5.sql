@@ -1,0 +1,29 @@
+-- Migration 0.140.4 → 0.140.5: dedup (main branch) maintains tombstone_count
+-- and rebuilds the HTAP view (VAL-380).
+--
+-- Root cause: the dedicated-tables (main) branch of
+-- storage::ops::dedup::deduplicate_predicate (src/storage/ops/dedup.rs)
+-- tombstoned duplicate (s,o,g) groups but never updated
+-- _pg_ripple.predicates.tombstone_count and never rebuilt the HTAP view
+-- when it was in the tombstone-skip form, so the new tombstones stayed
+-- invisible until some other path rebuilt the view (delete, clear, merge).
+-- Because the tombstone join is on (s,o,g), one tombstone masks EVERY main
+-- row of the group — including the minimum-SID row that must survive — so
+-- once the view did honour tombstones, a duplicate group with no delta row
+-- vanished from reads and the next merge dropped it permanently.
+--
+-- Fix (Rust only — dedup.rs, scan.rs): the main branch now (1) tombstones
+-- each duplicate group once, existence-guarded, so repeated runs are no-ops
+-- and a real delete is never undone; (2) re-asserts the group's minimum-SID
+-- row into delta in the same statement, so the tombstone-aware view keeps
+-- returning the triple and the next merge collapses main to exactly one
+-- physical row; (3) decrements triple_count by the removed duplicates
+-- (same contract #20 gave the delta/vp_rare branches); (4) recomputes
+-- tombstone_count absolutely from the tombstones table and flips the view
+-- to the tombstone-aware form when the count leaves 0 (M15-05 contract).
+-- drop_graph's dedicated branch — exposed by the same regression's cleanup
+-- section — gets the same M15-05 block (clear_graph_by_id already had it).
+--
+-- No SQL objects change: the extension carries no new schema in this
+-- version. This script exists only so the migration chain from 0.140.3
+-- reaches 0.140.5 (comment-only marker, same as 0.140.2 → 0.140.3).
