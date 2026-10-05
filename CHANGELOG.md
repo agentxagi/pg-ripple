@@ -6,6 +6,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
+## [0.141.0]
+
+Cross-graph justification: the graph-scoped `justify(s, p, o, g)` resolves
+provenance by logical triple, not by the caller's statement ID (VAL-391).
+
+### Fixed
+
+- **A cross-tenant copy of a derived fact justified as `base` forever.**
+  `build_proof_tree_graph` (`src/datalog/derivations.rs`) looked up
+  `_pg_ripple.derivations` strictly by the asking graph's SID. A graph
+  holding an asserted copy of a derived triple (same s/p/o, its own SID, no
+  derivation row — the ValorBrain cross-tenant mirror shape) got `base`
+  even when it held every antecedent of the recorded rule application:
+  the recorded rows hang off the recording graph's SID and antecedent
+  validation matched those foreign SIDs against the asking graph
+  (`kg_explain` answered `unverified` for the copy, VAL-187/VAL-391). When
+  the node's own row has no derivations, the builder now falls back to
+  derivation rows recorded for any materialisation of the same logical
+  triple, rebuilt with antecedents re-resolved inside the caller's graph:
+  a graph holding the conclusion AND all antecedents gets the tree with
+  its own SIDs (no re-inference needed); a graph missing any antecedent
+  still gets the bare `base` proof — an incomplete tree is never returned,
+  so the VAL-201 leak rule is preserved. Same-graph behaviour and the
+  graph-blind 3-arg `justify()` are unchanged. Regression:
+  `tests/pg_regress/sql/v0147_justify_cross_graph.sql` pins all five
+  cases (recording graph, conclusion-only, conclusion+antecedents,
+  near-miss antecedents, repeated reads).
+
 ## [0.140.6]
 
 Erasure completeness fix: `erase_subject()` now removes the erased id in
