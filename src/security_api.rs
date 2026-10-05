@@ -4,7 +4,7 @@
 //!
 //! - `grant_graph_access()` — create an RLS policy granting a role access to a named graph.
 //! - `revoke_graph_access()` — drop an RLS policy revoking a role's access to a named graph.
-//! - `erase_subject()` — GDPR-style erasure: atomically delete all triples with `s = encode(iri)`.
+//! - `erase_subject()` — GDPR-style erasure: atomically delete all triples that reference `encode(iri)` in any role (subject, object, or graph), plus the dictionary entry.
 //!
 //! # v0.67.0 RLS-01: VP table RLS coverage
 //!
@@ -386,12 +386,16 @@ pub(crate) fn erase_subject_impl(iri: &str) -> Vec<EraseRow> {
 
     let mut results: Vec<EraseRow> = Vec::new();
 
-    // Delete from vp_rare, decrementing each affected predicate's counter by
-    // the rows actually removed (VAL-376 — same delete-side leak as
-    // clear_graph/drop_graph: erasing a subject used to leave the catalog
-    // counting rows that no longer exist).
+    // Delete from vp_rare in every role the erased id can appear in — s, o or g
+    // (VAL-378: object references survived the erase and left rows whose
+    // dictionary entry no longer resolved, firing "batch_decode: dictionary
+    // entry missing" on SPARQL results) — decrementing each affected
+    // predicate's counter by the rows actually removed (VAL-376 — same
+    // delete-side leak as clear_graph/drop_graph: erasing a subject used to
+    // leave the catalog counting rows that no longer exist).
     let rare_deleted: i64 = pgrx::Spi::get_one_with_args::<i64>(
-        "WITH d AS (DELETE FROM _pg_ripple.vp_rare WHERE s = $1 RETURNING p), \
+        "WITH d AS (DELETE FROM _pg_ripple.vp_rare \
+             WHERE s = $1 OR o = $1 OR g = $1 RETURNING p), \
              agg AS (SELECT p, count(*) AS cnt FROM d GROUP BY p), \
              upd AS ( \
                  UPDATE _pg_ripple.predicates pr \
@@ -428,12 +432,12 @@ pub(crate) fn erase_subject_impl(iri: &str) -> Vec<EraseRow> {
         });
         ids
     };
-
+    // Delete from all dedicated VP tables (s, o and g roles — VAL-378).
     for pred_id in &pred_ids {
         // Attempt delete from delta table.
         let delta_table = format!("_pg_ripple.vp_{pred_id}_delta");
         let delta_sql = format!(
-            "WITH d AS (DELETE FROM {delta_table} WHERE s = $1 RETURNING 1) SELECT count(*)::bigint FROM d"
+            "WITH d AS (DELETE FROM {delta_table} WHERE s = $1 OR o = $1 OR g = $1 RETURNING 1) SELECT count(*)::bigint FROM d"
         );
         let delta_cnt: i64 =
             pgrx::Spi::get_one_with_args::<i64>(&delta_sql, &[DatumWithOid::from(subject_id)])
@@ -456,7 +460,7 @@ pub(crate) fn erase_subject_impl(iri: &str) -> Vec<EraseRow> {
         // Attempt delete from main table.
         let main_table = format!("_pg_ripple.vp_{pred_id}_main");
         let main_sql = format!(
-            "WITH d AS (DELETE FROM {main_table} WHERE s = $1 RETURNING 1) SELECT count(*)::bigint FROM d"
+            "WITH d AS (DELETE FROM {main_table} WHERE s = $1 OR o = $1 OR g = $1 RETURNING 1) SELECT count(*)::bigint FROM d"
         );
         if let Ok(cnt) =
             pgrx::Spi::get_one_with_args::<i64>(&main_sql, &[DatumWithOid::from(subject_id)])
@@ -475,6 +479,75 @@ pub(crate) fn erase_subject_impl(iri: &str) -> Vec<EraseRow> {
                     rows_deleted: n,
                 });
             }
+        }
+    }
+
+    // Delete pattern-cache rows keyed by the erased id (VAL-378): the HTAP
+    // star-pattern caches hold s/o dictionary ids as row keys; leaving them
+    // behind kept an undecodable key alive after the dictionary entry was
+    // gone (the production orphan was exactly an object_patterns row).
+    let obj_pat_cnt: i64 = pgrx::Spi::get_one_with_args::<i64>(
+        "WITH d AS (DELETE FROM _pg_ripple.object_patterns WHERE o = $1 RETURNING 1) SELECT count(*)::bigint FROM d",
+        &[DatumWithOid::from(subject_id)],
+    )
+    .unwrap_or(None)
+    .unwrap_or(0);
+    if obj_pat_cnt > 0 {
+        results.push(EraseRow {
+            relation: "_pg_ripple.object_patterns".to_owned(),
+            rows_deleted: obj_pat_cnt,
+        });
+    }
+    let subj_pat_cnt: i64 = pgrx::Spi::get_one_with_args::<i64>(
+        "WITH d AS (DELETE FROM _pg_ripple.subject_patterns WHERE s = $1 RETURNING 1) SELECT count(*)::bigint FROM d",
+        &[DatumWithOid::from(subject_id)],
+    )
+    .unwrap_or(None)
+    .unwrap_or(0);
+    if subj_pat_cnt > 0 {
+        results.push(EraseRow {
+            relation: "_pg_ripple.subject_patterns".to_owned(),
+            rows_deleted: subj_pat_cnt,
+        });
+    }
+
+    // If the erased IRI was ever used as a named graph, drop its registry
+    // row too — the g-role deletes above already removed its triples.
+    let ng_cnt: i64 = pgrx::Spi::get_one_with_args::<i64>(
+        "WITH d AS (DELETE FROM _pg_ripple.named_graphs WHERE graph_id = $1 RETURNING 1) SELECT count(*)::bigint FROM d",
+        &[DatumWithOid::from(subject_id)],
+    )
+    .unwrap_or(None)
+    .unwrap_or(0);
+    if ng_cnt > 0 {
+        results.push(EraseRow {
+            relation: "_pg_ripple.named_graphs".to_owned(),
+            rows_deleted: ng_cnt,
+        });
+    }
+
+    // Evict the erased id from the unlogged hot cache (best-effort; table is
+    // created lazily).  A stale hot row would hand the deleted id back to a
+    // future insert of the same IRI, silently re-creating the orphan.
+    let hot_exists: bool = pgrx::Spi::get_one::<bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = '_pg_ripple' AND c.relname = 'dictionary_hot')",
+    )
+    .unwrap_or(None)
+    .unwrap_or(false);
+    if hot_exists {
+        let hot_cnt: i64 = pgrx::Spi::get_one_with_args::<i64>(
+            "WITH d AS (DELETE FROM _pg_ripple.dictionary_hot WHERE id = $1 RETURNING 1) SELECT count(*)::bigint FROM d",
+            &[DatumWithOid::from(subject_id)],
+        )
+        .unwrap_or(None)
+        .unwrap_or(0);
+        if hot_cnt > 0 {
+            results.push(EraseRow {
+                relation: "_pg_ripple.dictionary_hot".to_owned(),
+                rows_deleted: hot_cnt,
+            });
         }
     }
 
@@ -560,8 +633,9 @@ pub(crate) fn erase_subject_impl(iri: &str) -> Vec<EraseRow> {
         }
     }
 
-    // Remove the subject's dictionary entry if it's no longer referenced by any VP table.
-    // This is best-effort — we skip the cross-table reference check for performance.
+    // Remove the subject's dictionary entry.  Safe unconditionally now: every
+    // VP row (s/o/g roles), pattern cache, graph registry entry and hot-cache
+    // row referencing the id has been deleted above (VAL-378).
     let dict_cnt: i64 = pgrx::Spi::get_one_with_args::<i64>(
         "WITH d AS (DELETE FROM _pg_ripple.dictionary WHERE id = $1 RETURNING 1) SELECT count(*)::bigint FROM d",
         &[DatumWithOid::from(subject_id)],
@@ -621,13 +695,18 @@ mod pg_ripple {
 
     /// GDPR right-to-erasure: atomically remove all traces of a subject IRI.
     ///
-    /// Deletes from every storage layer that may hold data about `iri`:
-    /// - all dedicated VP delta and main tables
-    /// - `_pg_ripple.vp_rare`
+    /// Deletes from every storage layer that may hold data about `iri`,
+    /// matching the encoded id in every role it can appear in (subject,
+    /// object, or graph — VAL-378: object references used to survive the
+    /// erase and leave undecodable rows behind):
+    /// - `_pg_ripple.vp_rare` and all dedicated VP delta/main tables
+    /// - `_pg_ripple.subject_patterns` / `_pg_ripple.object_patterns`
+    /// - `_pg_ripple.named_graphs` (if the IRI was used as a graph)
+    /// - `_pg_ripple.dictionary_hot` (unlogged encode cache, if present)
     /// - `_pg_ripple.kge_embeddings`
     /// - `_pg_ripple.prov_log` (if present)
     /// - `_pg_ripple.audit_log` (if present)
-    /// - `_pg_ripple.dictionary` (subject entry if unreferenced)
+    /// - `_pg_ripple.dictionary` (subject entry)
     ///
     /// Returns one row per storage relation touched, with the deletion count.
     /// All deletes execute in the caller's transaction (atomic erasure).
