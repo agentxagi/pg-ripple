@@ -1,60 +1,59 @@
 -- pg_regress test: vector setup (v0.27.0)
 -- Checks pgvector availability and skips remaining vector tests gracefully.
 -- This test must pass in all CI environments, including those without pgvector.
-SET client_min_messages = warning;
+--
+-- Deterministic suite order (VAL-382): renamed from vector_setup.sql with a
+-- 000_ prefix so it sorts first, and renamed away from the "setup.sql" suffix
+-- on purpose.  cargo-pgrx 0.18.0 organize_files() hoists the FIRST readdir
+-- entry whose name ends with "setup.sql" to the front of the test list, so a
+-- name collision made the suite order depend on directory readdir order (CI
+-- run 37242167878 hoisted this file; a different readdir hoists setup_wipe.sql
+-- instead and flips the recorded expected outputs).  Keep this file sorting
+-- before admin_api_v076.sql: on a fresh regress database it creates the
+-- extension that every later test assumes, exactly where the recorded
+-- expected outputs place that state transition.  The CI regress job guards
+-- against any sql/*.sql file ending in "setup.sql".
+--
+-- Deterministic library load (v0145/v0146 pattern): on a fresh database the
+-- .so loads at CREATE EXTENSION; when the extension already exists the load
+-- happens at the first C call.  Suppress the shared_preload_libraries
+-- advisory wherever it fires so the output does not depend on that position.
+SET client_min_messages TO error;
 CREATE EXTENSION IF NOT EXISTS pg_ripple;
-WARNING:  pg_ripple: loaded without shared_preload_libraries; HTAP merge worker, CONSTRUCT writeback, and dictionary cache are disabled. Add pg_ripple to shared_preload_libraries in postgresql.conf.
-SET client_min_messages = DEFAULT;
 SET search_path TO pg_ripple, public;
+
 -- Force the pg_ripple shared library to load in this session so that GUC
 -- registrations become visible in pg_settings.  When the extension is already
 -- installed, CREATE EXTENSION is a no-op and the library is *not* loaded
 -- automatically until a pg_ripple function is first called.
 SELECT pg_ripple.load_ntriples('') = 0 AS library_loaded;
- library_loaded 
-----------------
- t
-(1 row)
 
 -- ── pgvector availability gate ────────────────────────────────────────────────
 -- Probe whether pgvector is installed.  This drives all subsequent vector tests.
+
 SELECT CASE
     WHEN EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')
     THEN 'pgvector available'
     ELSE 'pgvector absent - vector tests will verify graceful degradation (expected in CI)'
 END AS pgvector_status;
-                                 pgvector_status                                  
-----------------------------------------------------------------------------------
- pgvector absent - vector tests will verify graceful degradation (expected in CI)
-(1 row)
 
 -- ── embeddings table existence ────────────────────────────────────────────────
 -- The migration script creates _pg_ripple.embeddings regardless of pgvector.
 -- When pgvector is absent it uses BYTEA; when present it uses vector(N).
+
 SELECT EXISTS(
     SELECT 1 FROM information_schema.tables
     WHERE table_schema = '_pg_ripple'
       AND table_name   = 'embeddings'
 ) AS embeddings_table_exists;
- embeddings_table_exists 
--------------------------
- t
-(1 row)
 
 -- ── GUC parameters are registered ────────────────────────────────────────────
+
 SELECT COUNT(*) >= 7 AS embedding_gucs_registered
 FROM pg_settings
 WHERE name LIKE 'pg_ripple.embedding%'
    OR name = 'pg_ripple.pgvector_enabled';
- embedding_gucs_registered 
----------------------------
- t
-(1 row)
 
 -- ── pgvector_enabled GUC default value ────────────────────────────────────────
-SELECT current_setting('pg_ripple.pgvector_enabled') AS pgvector_enabled_default;
- pgvector_enabled_default 
---------------------------
- on
-(1 row)
 
+SELECT current_setting('pg_ripple.pgvector_enabled') AS pgvector_enabled_default;

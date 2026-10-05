@@ -1,0 +1,16 @@
+-- pg_regress test: mid-suite wipe and clean reinstall of the extension
+-- Drops and recreates the extension to reset all state for the tests that
+-- sort after it (the regress database is shared by the whole suite).
+--
+-- Deterministic suite order (VAL-382): renamed from setup.sql, keeping the
+-- alphabetical slot between serialization.sql and shacl_advanced.sql.  The
+-- recorded expected outputs of the tests after this slot assume the wipe
+-- happens right here, mid-suite -- do not rename this file to anything that
+-- changes its sort position.  The rename itself exists because cargo-pgrx
+-- 0.18.0 organize_files() hoists the first readdir entry ending in
+-- "setup.sql" to the front of the test list, which (with the old
+-- vector_setup.sql also matching that suffix) made the order depend on
+-- readdir.  The CI regress job guards against reintroducing the suffix.
+DROP EXTENSION IF EXISTS pg_ripple CASCADE;
+CREATE EXTENSION pg_ripple;
+WARNING:  pg_ripple: loaded without shared_preload_libraries; HTAP merge worker, CONSTRUCT writeback, and dictionary cache are disabled. Add pg_ripple to shared_preload_libraries in postgresql.conf.

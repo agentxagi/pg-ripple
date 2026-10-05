@@ -219,6 +219,24 @@ jobs:
       - name: Initialise pgrx (PostgreSQL 18)
         run: cargo pgrx init --pg18 download
 
+      - name: Guard pg_regress order determinism (VAL-382)
+        # cargo-pgrx 0.18.0 organize_files() hoists the FIRST readdir entry
+        # whose name ends with "setup.sql" to the front of the test list (and
+        # the matching "*.out" in expected/).  With more than zero such files
+        # the suite order depends on directory readdir order, which flaked the
+        # canonical gate between machines.  The suite order must stay purely
+        # alphabetical: no sql/*.sql may end with "setup.sql" and no
+        # expected/*.out may end with "setup.out" (VAL-382).
+        run: |
+          sql_hits=$(ls tests/pg_regress/sql/ | grep -c 'setup\.sql$' || true)
+          out_hits=$(ls tests/pg_regress/expected/ | grep -c 'setup\.out$' || true)
+          if [ "$sql_hits" -ne 0 ] || [ "$out_hits" -ne 0 ]; then
+            echo "::error::pg_regress order guard: $sql_hits sql file(s) ending in setup.sql and $out_hits expected file(s) ending in setup.out."
+            echo "::error::cargo-pgrx 0.18.0 hoists the first readdir 'setup.sql' suffix match (VAL-382); rename so no file ends with setup.sql/setup.out."
+            exit 1
+          fi
+          echo "pg_regress order guard OK: no setup.sql/setup.out suffix collisions; suite order is purely alphabetical."
+
       - name: Run pg_regress suite
         run: cargo pgrx regress pg18 --postgresql-conf "allow_system_table_mods=on"
 
