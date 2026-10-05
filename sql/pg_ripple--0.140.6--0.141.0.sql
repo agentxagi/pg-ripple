@@ -1,0 +1,25 @@
+-- Migration 0.140.6 → 0.141.0
+--
+-- VAL-391: graph-scoped justify() resolves provenance by logical triple.
+--
+-- Defect (Rust only — src/datalog/derivations.rs): the graph-scoped
+-- justify(s, p, o, g) looked up _pg_ripple.derivations strictly by the
+-- caller's graph statement ID.  A cross-tenant copy of a derived triple
+-- (same s/p/o materialised in another graph as an asserted row) therefore
+-- justified as `base` forever, even when the asking graph held every
+-- antecedent of the recorded rule application — the recorded rows hang off
+-- the recording graph's SID, and antecedent validation matched those
+-- foreign SIDs against the asking graph.  Evidence: ValorBrain VAL-187 /
+-- VAL-391 (kg/indirectly_runs_on conclusions mirrored across tenant
+-- graphs; the kg_explain surface answered `unverified` for the copy).
+--
+-- Fix (Rust only): when a node's own row carries no recorded derivation,
+-- build_proof_tree_graph falls back to derivation rows recorded for ANY
+-- materialisation of the same logical triple, with antecedents re-resolved
+-- inside the caller's graph.  A graph holding the conclusion AND all
+-- antecedents gets the tree (its own SIDs); a graph missing any antecedent
+-- still gets `base` — an incomplete tree is never returned, so the
+-- cross-graph leak rule is preserved.
+--
+-- No SQL objects change.
+-- Regression: tests/pg_regress/sql/v0147_justify_cross_graph.sql

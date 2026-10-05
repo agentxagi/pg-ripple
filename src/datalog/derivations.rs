@@ -463,6 +463,81 @@ fn derivations_for_sid(sid: i64) -> Vec<(String, String, Vec<i64>)> {
     })
 }
 
+/// All SIDs materialising the logical triple `(s_id, p_id, o_id)` across
+/// storages and graphs — `vp_rare` plus the predicate's dedicated VP view
+/// when one exists (VAL-391).
+fn sids_for_triple_any_graph(p_id: i64, s_id: i64, o_id: i64) -> Vec<i64> {
+    let mut sids: Vec<i64> = Spi::connect(|c| {
+        Ok::<_, pgrx::spi::SpiError>(
+            c.select(
+                "SELECT i FROM _pg_ripple.vp_rare WHERE p = $1 AND s = $2 AND o = $3",
+                None,
+                &[
+                    DatumWithOid::from(p_id),
+                    DatumWithOid::from(s_id),
+                    DatumWithOid::from(o_id),
+                ],
+            )?
+            .filter_map(|row| row.get::<i64>(1).ok().flatten())
+            .collect(),
+        )
+    })
+    .unwrap_or_default();
+
+    if let Some(view) = crate::storage::vp_rare_io::get_dedicated_vp_table(p_id) {
+        let promoted: Vec<i64> = Spi::connect(|c| {
+            Ok::<_, pgrx::spi::SpiError>(
+                c.select(
+                    &format!("SELECT i FROM {view} WHERE s = $1 AND o = $2"),
+                    None,
+                    &[DatumWithOid::from(s_id), DatumWithOid::from(o_id)],
+                )?
+                .filter_map(|row| row.get::<i64>(1).ok().flatten())
+                .collect(),
+            )
+        })
+        .unwrap_or_default();
+        sids.extend(promoted);
+    }
+    sids
+}
+
+/// Map antecedent SIDs recorded against a foreign materialisation of the
+/// triple to the SIDs of the SAME triples inside `g_id`.  `None` when any
+/// antecedent triple is absent from the graph — the branch stays incomplete,
+/// never a partial tree (same rule the in-graph builder applies to own rows).
+fn antecedents_in_graph(antecedent_sids: &[i64], g_id: i64) -> Option<Vec<i64>> {
+    let mut mapped = Vec::with_capacity(antecedent_sids.len());
+    for &ant in antecedent_sids {
+        let (p_id, s_id, o_id) = triple_ids_for_sid(ant)?;
+        mapped.push(sid_for_triple_in_graph(p_id, s_id, o_id, g_id)?);
+    }
+    Some(mapped)
+}
+
+/// Derivation rows recorded for ANY materialisation of the logical triple
+/// `(s_id, p_id, o_id)`, rebuilt so every antecedent resolves inside `g_id`
+/// (VAL-391).  Provenance is keyed by triple values + rule application, not
+/// by row identity: a graph holding the conclusion AND all antecedents of a
+/// recorded rule application gets the same tree the recording graph gets,
+/// with its own SIDs; a graph missing any antecedent gets no tree (no leak).
+fn cross_graph_derivations_in_graph(
+    s_id: i64,
+    p_id: i64,
+    o_id: i64,
+    g_id: i64,
+) -> Vec<(String, String, Vec<i64>)> {
+    let mut rows: Vec<(String, String, Vec<i64>)> = Vec::new();
+    for cand in sids_for_triple_any_graph(p_id, s_id, o_id) {
+        for (rule_name, rule_set, antecedent_sids) in derivations_for_sid(cand) {
+            if let Some(mapped) = antecedents_in_graph(&antecedent_sids, g_id) {
+                rows.push((rule_name, rule_set, mapped));
+            }
+        }
+    }
+    rows
+}
+
 /// Resolve the current rule text for a derivation's `(rule_set, rule_name)`.
 ///
 /// VAL-208: `rule_name` is a stable identity, not the rule text; display
@@ -861,7 +936,8 @@ fn build_proof_tree_graph(
     }
 
     // Look up the triple's human-readable labels (SID already validated above).
-    let triple_label = if let Some((p_id, s_id, o_id)) = triple_ids_for_sid(sid) {
+    let node_ids = triple_ids_for_sid(sid);
+    let triple_label = if let Some((p_id, s_id, o_id)) = node_ids {
         let decode_map = batch_decode(&[s_id, p_id, o_id]);
         serde_json::json!({
             "subject":   decode_map.get(&s_id).cloned().unwrap_or_else(|| format!("<id:{s_id}>")),
@@ -872,17 +948,37 @@ fn build_proof_tree_graph(
         serde_json::json!({ "sid": sid })
     };
 
-    let derivation_rows = derivations_for_sid(sid);
-
-    if derivation_rows.is_empty() {
-        // Base fact — no derivation recorded.
-        visited.remove(&sid);
-        return Some(serde_json::json!({
-            "type": "base",
-            "sid": sid,
-            "triple": triple_label
-        }));
-    }
+    // VAL-391: provenance is triple-keyed.  When THIS row carries no recorded
+    // derivation, fall back to derivations recorded for another
+    // materialisation of the same logical triple — rebuilt with antecedents
+    // resolved inside the caller's graph, so the tree only ever names triples
+    // the graph already holds.  When no branch survives (or the triple cannot
+    // be resolved), the node stays a plain base fact, exactly as before.
+    let derivation_rows: Vec<(String, String, Vec<i64>)> = match derivations_for_sid(sid) {
+        rows if !rows.is_empty() => rows,
+        _ => match node_ids {
+            Some((p_id, s_id, o_id)) => {
+                let fallback = cross_graph_derivations_in_graph(s_id, p_id, o_id, g_id);
+                if fallback.is_empty() {
+                    visited.remove(&sid);
+                    return Some(serde_json::json!({
+                        "type": "base",
+                        "sid": sid,
+                        "triple": triple_label
+                    }));
+                }
+                fallback
+            }
+            None => {
+                visited.remove(&sid);
+                return Some(serde_json::json!({
+                    "type": "base",
+                    "sid": sid,
+                    "triple": triple_label
+                }));
+            }
+        },
+    };
 
     // One entry per derivation rule.  A derivation whose proof reaches outside
     // the graph is dropped entirely; if no derivation survives the node's proof
