@@ -297,23 +297,34 @@ pub(crate) fn merge_predicate_with_hook(pred_id: i64, after_build: impl FnOnce()
         return 0;
     }
 
-    // MERGE-FENCE-01 (v0.81.0): two-phase lock strategy.
+    // MERGE-FENCE-01 (v0.81.0) / MERGE-RACE-01: the build phase (Steps 0–2)
+    // takes no table lock that blocks the query path; the swap (Step 3) locks
+    // the relations briefly, without waiting while holding them.
     //
-    // Phase 1 (build): Steps 1–2 (CREATE main_new + BRIN index) run without
-    // holding the exclusive per-predicate advisory lock.  `main_new` is a
-    // private scratch table so no other session can see it until the swap.
-    // A session-level shared advisory lock guards against concurrent merges
-    // on the same predicate while still allowing query-path reads and writes.
-    //
-    // Phase 2 (swap): Steps 3–5 (RENAME / view repoint / truncate delta)
-    // acquire the exclusive transaction-level advisory lock for a brief window
-    // (milliseconds) before doing DDL.  This minimises contention on the query
-    // path, which only needs to hold a RowShare lock.
+    // CC13-02 (v0.85.0): the per-predicate merge key is namespaced with the
+    // pg_ripple prefix 0x5052_5000 (the bare prefix is reserved for Citus
+    // rebalance events); only merges take `0x5052_5000 + pred_id`.
+    // MERGE-RACE-01: it is taken HERE, for the whole merge, not just the swap.
+    // Two merges of one predicate must not overlap: the second would snapshot
+    // delta rows the first already moved into the new main and copy them
+    // twice (worker with merge_workers = 1 and compact() take no other lock).
+    const MERGE_FENCE_NAMESPACE: i64 = 0x5052_5000;
+    Spi::run_with_args(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[DatumWithOid::from(
+            MERGE_FENCE_NAMESPACE.wrapping_add(pred_id),
+        )],
+    )
+    .unwrap_or_else(|e| pgrx::error!("merge: advisory lock error: {e}"));
 
     let main = format!("_pg_ripple.vp_{pred_id}_main");
     let main_new = format!("_pg_ripple.vp_{pred_id}_main_new");
     let delta = format!("_pg_ripple.vp_{pred_id}_delta");
     let tombs = format!("_pg_ripple.vp_{pred_id}_tombstones");
+    let view = format!("_pg_ripple.vp_{pred_id}");
+    // Guard for the swap: main must still be the relation main_new was built from.
+    let main_oid_at_build = Spi::get_one::<i64>(&format!("SELECT '{main}'::regclass::oid::bigint"))
+        .unwrap_or_else(|e| pgrx::error!("merge: main oid lookup error: {e}"));
     // MERGE-RACE-01: private snapshots of the delta / tombstone rows this cycle
     // consumes.  They replace v0.22.0 C-4's `max_sid_at_snapshot` (a
     // `last_value` read of statement_id_seq): sequences are not
@@ -410,52 +421,55 @@ pub(crate) fn merge_predicate_with_hook(pred_id: i64, after_build: impl FnOnce()
     after_build();
 
     // Step 3: F7-1 (v0.60.0) — atomic rename-swap that never leaves the backing
-    // relation non-existent.  The sequence:
-    //   a. Rename old main → main_old  (view OID still resolves to the old table)
-    //   b. Rename main_new → main      (view OID still resolves to old; queries work)
-    //   c. CREATE OR REPLACE VIEW      (atomically repoints the view to new main)
-    //   d. DROP old main_old           (removes old data; old index dropped with it)
-    //   e. Rename new BRIN index to canonical name
+    // relation non-existent: a. main → main_old, b. main_new → main,
+    // c. CREATE OR REPLACE VIEW, d. DROP main_old, e. rename the BRIN index.
     //
-    // MERGE-FENCE-01 (v0.81.0): Acquire the exclusive per-predicate advisory lock
-    // HERE — just before the swap — not at the start of the function.  This means
-    // the slow BRIN-index build (Steps 1–2) runs without holding the lock, keeping
-    // contention on the query path to a minimum.  The ExclusiveLock is held only
-    // for the short DDL window (Steps 3a–3e, typically < 10 ms).
-    //
-    // CC13-02 (v0.85.0): namespace the lock key with the pg_ripple merge fence
-    // prefix (0x5052_5000) so that the per-predicate locks do not clash with
-    // advisory locks held by Citus, pg_partman, or other extensions.
-    // The global key 0x5052_5000 itself is reserved for Citus rebalance events.
-    // lock_key = 0x5052_5000 + pred_id (wrapping to stay within i64 range).
-    const MERGE_FENCE_NAMESPACE: i64 = 0x5052_5000;
-    let merge_lock_key = MERGE_FENCE_NAMESPACE.wrapping_add(pred_id);
-    Spi::run_with_args(
-        "SELECT pg_advisory_xact_lock($1)",
-        &[DatumWithOid::from(merge_lock_key)],
-    )
-    .unwrap_or_else(|e| pgrx::error!("merge: advisory lock (swap phase) error: {e}"));
-
-    // Use lock_timeout to avoid blocking the query path for too long.
-    // MERGE-LOCK-GUC-01 (v0.82.0): use GUC value instead of hardcoded 5s.
+    // MERGE-RACE-01: lock everything the swap and cleanup touch in ONE step,
+    // never waiting while holding part of it.  Locking the view ACCESS
+    // EXCLUSIVE recursively locks main, delta and tombstones (and covers the
+    // view rebuilds below): in-flight writers drain first, new ones block
+    // until commit.  Each attempt waits at most 25 ms (well under
+    // deadlock_timeout), so a transaction that read the view and then writes
+    // delta never deadlocks with us; failed attempts roll back their
+    // subtransaction (releasing partial locks) and retry with backoff until
+    // pg_ripple.merge_lock_timeout_ms, then the merge aborts with no loss.
     let lock_timeout_ms = crate::MERGE_LOCK_TIMEOUT_MS.get();
+    Spi::run(&format!(
+        "DO $merge_lock$ \
+         DECLARE \
+             deadline timestamptz := clock_timestamp() + {lock_timeout_ms} * interval '1 ms'; \
+             backoff float8 := 0.005; \
+         BEGIN \
+             PERFORM set_config('lock_timeout', '25ms', true); \
+             LOOP \
+                 BEGIN \
+                     LOCK TABLE {view} IN ACCESS EXCLUSIVE MODE; \
+                     RETURN; \
+                 EXCEPTION WHEN lock_not_available THEN \
+                     IF clock_timestamp() >= deadline THEN \
+                         RAISE EXCEPTION 'merge: could not lock {view} within {lock_timeout_ms} ms' \
+                             USING ERRCODE = 'lock_not_available'; \
+                     END IF; \
+                     PERFORM pg_sleep(backoff); \
+                     backoff := least(backoff * 2, 0.1); \
+                 END; \
+             END LOOP; \
+         END $merge_lock$"
+    ))
+    .unwrap_or_else(|e| pgrx::error!("merge: swap lock error: {e}"));
+    // MERGE-LOCK-GUC-01 (v0.82.0): remaining statements use the GUC timeout.
     Spi::run_with_args(
         &format!("SET LOCAL lock_timeout = '{lock_timeout_ms}ms'"),
         &[],
     )
     .unwrap_or_else(|e| pgrx::error!("merge: set lock_timeout error: {e}"));
 
-    // MERGE-RACE-01: fence the write inbox for the swap + cleanup.  EXCLUSIVE mode
-    // waits for in-flight writers to commit and blocks new ones until this
-    // transaction ends (reads keep working — weaker than the ACCESS
-    // EXCLUSIVE the old `TRUNCATE {delta}` took).  Taken BEFORE main is
-    // renamed: a writer holding RowExclusive on delta may still need main
-    // (delete_triple reads it), so locking main first invites 40P01.
-    Spi::run_with_args(
-        &format!("LOCK TABLE {delta}, {tombs} IN EXCLUSIVE MODE"),
-        &[],
-    )
-    .unwrap_or_else(|e| pgrx::error!("merge: lock delta/tombstones error: {e}"));
+    let main_oid_now = Spi::get_one::<i64>(&format!("SELECT '{main}'::regclass::oid::bigint"))
+        .unwrap_or_else(|e| pgrx::error!("merge: main oid lookup error: {e}"));
+    if main_oid_now != main_oid_at_build {
+        pgrx::warning!("merge: {main} changed OID during the merge");
+        pgrx::error!("merge: main table was replaced while main_new was built; aborting merge");
+    }
 
     // MERGE-RACE-01: a snapshotted delta row that a concurrent delete_triple removed
     // while main_new was being built (deletes of delta-resident triples drop
@@ -511,7 +525,6 @@ pub(crate) fn merge_predicate_with_hook(pred_id: i64, after_build: impl FnOnce()
 
     // c. CREATE OR REPLACE VIEW — atomically repoints to new main OID.
     // The view must exist for find_triples / SPARQL queries to work correctly.
-    let view = format!("_pg_ripple.vp_{pred_id}");
     // M15-05 (v0.96.0): after renaming main_new → main, we have clean merged data.
     // Tombstones will be cleared in step 4; use the full LEFT JOIN form here
     // (tombstones may still exist until the DELETE below, and tombstones
@@ -654,18 +667,22 @@ pub(crate) fn merge_predicate_with_hook(pred_id: i64, after_build: impl FnOnce()
         .unwrap_or_else(|e| pgrx::warning!("merge: tombstones_cleared_at update error: {e}"));
     }
 
-    // M15-05 (v0.96.0): check if tombstones are now all gone; if so reset
-    // tombstone_count and rebuild the view to the tombstone-skip form.
+    // M15-05 (v0.96.0): tombstone_count tracks the tombstones that survive the
+    // cleanup (MERGE-RACE-01: written mid-merge); at 0 the view is rebuilt to
+    // the tombstone-skip form.
     let remaining_tombs: i64 =
         Spi::get_one_with_args::<i64>(&format!("SELECT count(*)::bigint FROM {tombs}"), &[])
             .unwrap_or(None)
             .unwrap_or(1); // default 1 = assume tombstones remain, safer
+    Spi::run_with_args(
+        "UPDATE _pg_ripple.predicates SET tombstone_count = $2 WHERE id = $1",
+        &[
+            DatumWithOid::from(pred_id),
+            DatumWithOid::from(remaining_tombs),
+        ],
+    )
+    .unwrap_or_else(|e| pgrx::warning!("merge: update tombstone_count error: {e}"));
     if remaining_tombs == 0 {
-        Spi::run_with_args(
-            "UPDATE _pg_ripple.predicates SET tombstone_count = 0 WHERE id = $1",
-            &[DatumWithOid::from(pred_id)],
-        )
-        .unwrap_or_else(|e| pgrx::warning!("merge: reset tombstone_count error: {e}"));
         rebuild_htap_view(pred_id, false);
     }
 
@@ -758,7 +775,7 @@ pub(crate) fn notify_merge_lifecycle(pred_id: i64, merged: i64, tombstones: i64)
 pub fn merge_all() -> i64 {
     let pred_ids: Vec<i64> = Spi::connect(|c| {
         c.select(
-            "SELECT id FROM _pg_ripple.predicates WHERE htap = true",
+            "SELECT id FROM _pg_ripple.predicates WHERE htap = true ORDER BY id",
             None,
             &[],
         )
@@ -926,233 +943,14 @@ pub fn compact() -> i64 {
 
 // ─── Migrate flat table to HTAP ───────────────────────────────────────────────
 
-/// Migrate an existing flat VP table `_pg_ripple.vp_{id}` to the HTAP split.
-///
-/// Called from the `ALTER EXTENSION pg_ripple UPDATE` migration script
-/// via the `pg_ripple.htap_migrate_predicate(bigint)` function.
-pub fn migrate_flat_to_htap(pred_id: i64) {
-    let flat = format!("_pg_ripple.vp_{pred_id}");
-    let backup = format!("_pg_ripple.vp_{pred_id}_pre_htap");
-    let delta = format!("_pg_ripple.vp_{pred_id}_delta");
-    let main = format!("_pg_ripple.vp_{pred_id}_main");
-    let tombs = format!("_pg_ripple.vp_{pred_id}_tombstones");
-    let view = format!("_pg_ripple.vp_{pred_id}");
+// Extracted to merge_migrate.rs (MERGE-RACE-01: keeps merge.rs under the
+// 1,000-line Q13-04 gate).
+#[path = "merge_migrate.rs"]
+mod migrate;
+pub use migrate::migrate_flat_to_htap;
 
-    // Check if already migrated.
-    if is_htap(pred_id) {
-        return;
-    }
-
-    // Rename flat table → backup.
-    Spi::run_with_args(
-        &format!("ALTER TABLE IF EXISTS {flat} RENAME TO vp_{pred_id}_pre_htap"),
-        &[],
-    )
-    .unwrap_or_else(|e| pgrx::error!("htap_migrate: rename flat error: {e}"));
-
-    // Create delta table (copy existing rows into it as the write inbox).
-    Spi::run_with_args(
-        &format!("CREATE TABLE {delta} AS SELECT * FROM {backup}"),
-        &[],
-    )
-    .unwrap_or_else(|e| pgrx::error!("htap_migrate: create delta error: {e}"));
-
-    Spi::run_with_args(
-        &format!("CREATE INDEX idx_vp_{pred_id}_delta_s_o ON {delta} (s, o)"),
-        &[],
-    )
-    .unwrap_or_else(|e| pgrx::error!("htap_migrate: delta index(s,o) error: {e}"));
-
-    Spi::run_with_args(
-        &format!("CREATE INDEX idx_vp_{pred_id}_delta_o_s ON {delta} (o, s)"),
-        &[],
-    )
-    .unwrap_or_else(|e| pgrx::error!("htap_migrate: delta index(o,s) error: {e}"));
-
-    // Create empty main table.
-    Spi::run_with_args(
-        &format!(
-            "CREATE TABLE {main} ( \
-                 s      BIGINT   NOT NULL, \
-                 o      BIGINT   NOT NULL, \
-                 g      BIGINT   NOT NULL DEFAULT 0, \
-                 i      BIGINT   NOT NULL DEFAULT nextval('_pg_ripple.statement_id_seq'), \
-                 source SMALLINT NOT NULL DEFAULT 0 \
-             )"
-        ),
-        &[],
-    )
-    .unwrap_or_else(|e| pgrx::error!("htap_migrate: create main error: {e}"));
-
-    Spi::run_with_args(
-        &format!("CREATE INDEX idx_vp_{pred_id}_main_brin ON {main} USING BRIN (s)"),
-        &[],
-    )
-    .unwrap_or_else(|e| pgrx::error!("htap_migrate: main BRIN index error: {e}"));
-
-    // Create empty tombstones table.
-    Spi::run_with_args(
-        &format!(
-            "CREATE TABLE {tombs} ( \
-                 s BIGINT NOT NULL, \
-                 o BIGINT NOT NULL, \
-                 g BIGINT NOT NULL DEFAULT 0, \
-                 i BIGINT NOT NULL DEFAULT nextval('_pg_ripple.statement_id_seq') \
-             )"
-        ),
-        &[],
-    )
-    .unwrap_or_else(|e| pgrx::error!("htap_migrate: create tombstones error: {e}"));
-
-    Spi::run_with_args(
-        &format!("CREATE INDEX idx_vp_{pred_id}_tombs ON {tombs} (s, o, g)"),
-        &[],
-    )
-    .unwrap_or_else(|e| pgrx::error!("htap_migrate: tombstones index error: {e}"));
-
-    // Create the view.
-    Spi::run_with_args(
-        &format!(
-            "CREATE VIEW {view} AS \
-             SELECT m.s, m.o, m.g, m.i, m.source \
-             FROM {main} m \
-             LEFT JOIN {tombs} t ON m.s = t.s AND m.o = t.o AND m.g = t.g \
-             WHERE t.s IS NULL \
-             UNION ALL \
-             SELECT d.s, d.o, d.g, d.i, d.source \
-             FROM {delta} d"
-        ),
-        &[],
-    )
-    .unwrap_or_else(|e| pgrx::error!("htap_migrate: create view error: {e}"));
-
-    // Update predicates catalog.
-    Spi::run_with_args(
-        "UPDATE _pg_ripple.predicates \
-         SET table_oid = $2::regclass::oid, htap = true \
-         WHERE id = $1",
-        &[
-            DatumWithOid::from(pred_id),
-            DatumWithOid::from(view.as_str()),
-        ],
-    )
-    .unwrap_or_else(|e| pgrx::error!("htap_migrate: predicates update error: {e}"));
-
-    // Drop the backup table.
-    Spi::run_with_args("SET LOCAL pg_ripple.maintenance_mode = 'on'", &[])
-        .unwrap_or_else(|e| pgrx::error!("htap_migrate: set maintenance_mode error: {e}"));
-    Spi::run_with_args(&format!("DROP TABLE IF EXISTS {backup}"), &[])
-        .unwrap_or_else(|e| pgrx::error!("htap_migrate: drop backup error: {e}"));
-}
+// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
-// A16-CQ: test helper — unwrap/expect are acceptable in test-only code.
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use pgrx::prelude::*;
-
-    // MERGE-RACE-01: the hook of merge_predicate_with_hook runs after main_new
-    // is built and before the swap phase — exactly where concurrent writers
-    // used to commit rows that the cleanup then destroyed.  Writing from the
-    // hook in the same transaction is visible to every later merge statement
-    // (READ COMMITTED: fresh snapshot per statement), which is what a
-    // concurrent commit looks like to the old `TRUNCATE {delta}`.
-
-    const S: &str = "<https://merge-race.test/s>";
-
-    /// A predicate promoted to its HTAP split, holding one triple (s, p, o0).
-    fn promoted_predicate(p: &str) -> i64 {
-        crate::storage::insert_triple(S, p, "<https://merge-race.test/o0>", 0);
-        let p_id = crate::dictionary::encode(
-            crate::storage::strip_angle_brackets_pub(p),
-            crate::dictionary::KIND_IRI,
-        );
-        crate::storage::promote::promote_predicate_pub(p_id);
-        assert!(
-            super::is_htap(p_id),
-            "predicate must be HTAP after promotion"
-        );
-        p_id
-    }
-
-    fn visible(p_id: i64, o: &str) -> i64 {
-        let o_id = crate::storage::encode_rdf_term(o);
-        Spi::get_one_with_args::<i64>(
-            &format!("SELECT count(*)::bigint FROM _pg_ripple.vp_{p_id} WHERE o = $1"),
-            &[pgrx::datum::DatumWithOid::from(o_id)],
-        )
-        .unwrap()
-        .unwrap_or(0)
-    }
-
-    #[pg_test]
-    fn test_merge_keeps_delta_row_inserted_mid_merge() {
-        let p = "<https://merge-race.test/p_insert>";
-        let p_id = promoted_predicate(p);
-        let late = "<https://merge-race.test/late>";
-
-        super::merge_predicate_with_hook(p_id, || {
-            crate::storage::insert_triple(S, p, late, 0);
-        });
-
-        assert_eq!(visible(p_id, late), 1, "row inserted mid-merge was lost");
-        assert_eq!(visible(p_id, "<https://merge-race.test/o0>"), 1);
-        let count = Spi::get_one_with_args::<i64>(
-            "SELECT triple_count FROM _pg_ripple.predicates WHERE id = $1",
-            &[pgrx::datum::DatumWithOid::from(p_id)],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            count, 2,
-            "triple_count must include the surviving delta row"
-        );
-
-        // The next cycle folds the survivor into main.
-        super::merge_predicate(p_id);
-        assert_eq!(visible(p_id, late), 1);
-        let delta_rows = Spi::get_one::<i64>(&format!(
-            "SELECT count(*)::bigint FROM _pg_ripple.vp_{p_id}_delta"
-        ))
-        .unwrap()
-        .unwrap();
-        assert_eq!(delta_rows, 0);
-    }
-
-    #[pg_test]
-    fn test_merge_keeps_tombstone_written_mid_merge() {
-        let p = "<https://merge-race.test/p_tomb>";
-        let p_id = promoted_predicate(p);
-        let o0 = "<https://merge-race.test/o0>";
-        super::merge_predicate(p_id); // o0 now lives in main
-
-        // A delete of a main-resident triple writes a tombstone.  With the
-        // default tombstone_retention_seconds = 0 the old merge TRUNCATEd it.
-        super::merge_predicate_with_hook(p_id, || {
-            crate::storage::delete_triple(S, p, o0, 0);
-        });
-        assert_eq!(visible(p_id, o0), 0, "delete during merge was undone");
-
-        super::merge_predicate(p_id);
-        assert_eq!(visible(p_id, o0), 0, "delete undone by the following merge");
-    }
-
-    #[pg_test]
-    fn test_merge_drops_delta_row_deleted_mid_merge() {
-        let p = "<https://merge-race.test/p_delete>";
-        let p_id = promoted_predicate(p);
-        let o0 = "<https://merge-race.test/o0>";
-
-        // o0 is still in delta: delete_triple removes the delta row and writes
-        // no tombstone, after main_new already copied it.
-        super::merge_predicate_with_hook(p_id, || {
-            crate::storage::delete_triple(S, p, o0, 0);
-        });
-        assert_eq!(
-            visible(p_id, o0),
-            0,
-            "deleted delta row resurrected in main"
-        );
-    }
-}
+#[path = "merge_tests.rs"]
+mod merge_tests;

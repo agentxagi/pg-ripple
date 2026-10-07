@@ -17,13 +17,14 @@
 -- triples (a 40P01 deadlock was logged in the same window); 78 freshly
 -- inserted related_to triples vanished (no row, no tombstone).
 --
--- Fix (Rust only): the merge snapshots delta and tombstones into private
--- temp tables, builds main_new from those snapshots, takes an EXCLUSIVE
--- lock on delta + tombstones for the swap (before renaming main), drops
--- from main_new any snapshotted delta row that a concurrent delete removed,
--- and deletes exactly the snapshotted rows (matched on s, o, g, i) instead
--- of TRUNCATE.  Rows written during the merge survive to the next cycle.
+-- Fix (Rust only): the merge serialises per predicate (advisory key
+-- 0x5052_5000 + id) for its whole duration, snapshots delta and tombstones
+-- into private temp tables, builds main_new from those snapshots, takes the
+-- swap locks in one non-waiting step (retry with backoff up to
+-- merge_lock_timeout_ms), drops from main_new any snapshotted delta row a
+-- concurrent delete removed, and deletes exactly the snapshotted rows
+-- (matched on s, o, g, i) instead of TRUNCATE.  Rows written during the
+-- merge survive to the next cycle.
 --
 -- No SQL objects change.
--- Regression: pg_tests in src/storage/merge.rs (tests module,
--- test_merge_*_mid_merge).
+-- Regression: pg_tests in src/storage/merge_tests.rs.

@@ -25,16 +25,26 @@ merge cycle is running (MERGE-RACE-01).
   was logged in the same window). Tombstones had the same defect: with the
   default `tombstone_retention_seconds = 0` they were TRUNCATEd, undoing
   deletes that arrived mid-merge; the `i <= max_sid_at_snapshot` branch was
-  unsound because sequences are not transactional. The merge now snapshots
-  delta and tombstones into private temp tables, builds `main_new` from the
-  snapshots, takes an `EXCLUSIVE` lock on delta + tombstones for the swap
-  (before renaming `main`, avoiding the lock-order inversion with writers
-  that read `main`), drops from `main_new` any snapshotted delta row a
-  concurrent delete removed, and deletes exactly the snapshotted rows
-  (matched on `s, o, g, i`). Rows written during the merge stay in delta
-  for the next cycle and are included in `triple_count`. Regression:
-  pg_tests `test_merge_*_mid_merge` in `src/storage/merge.rs` inject the
-  concurrent writes through an internal post-build hook.
+  unsound because sequences are not transactional. The merge now:
+  serialises per predicate on its advisory key (`0x5052_5000 + id`) for
+  the whole merge, so overlapping merges of one predicate (worker with
+  `merge_workers = 1`, `compact()`) can no longer copy rows twice and
+  then drop both copies; snapshots delta and tombstones into private temp
+  tables and builds `main_new` from them; takes the swap locks in one step
+  (`LOCK` of the VP view, ACCESS EXCLUSIVE, recursing to main/delta/
+  tombstones) with 25 ms attempts and backoff up to
+  `merge_lock_timeout_ms`, never waiting while holding part of them;
+  aborts if `main` was replaced meanwhile; drops from `main_new` any
+  snapshotted delta row a concurrent delete removed; and deletes exactly
+  the snapshotted rows (matched on `s, o, g, i`). Rows written during the
+  merge stay in delta for the next cycle and are included in
+  `triple_count`; `tombstone_count` is set to the surviving tombstones.
+  `merge_all()` merges predicates in id order. Regression: pg_tests in
+  `src/storage/merge_tests.rs` (internal post-build hook).
+- **Not fixed here:** the merge worker still merges every predicate in one
+  transaction, holding each merged predicate's swap locks until the end —
+  a remaining source of write stalls and of 40P01 deadlocks like the one
+  logged in production. Follow-up: one transaction per `merge_predicate`.
 
 ## [0.140.6]
 
