@@ -6,6 +6,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
+## [0.140.7]
+
+HTAP merge no longer loses rows (or undoes deletes) that commit while a
+merge cycle is running (MERGE-RACE-01).
+
+### Fixed
+
+- **Background merge truncated delta rows it had never merged.**
+  `merge_predicate` (`src/storage/merge.rs`) built `vp_{id}_main_new` from
+  `(main − tombstones) ∪ delta` without a lock and later ran
+  `TRUNCATE vp_{id}_delta`. Under READ COMMITTED every row committed into
+  delta after `main_new`'s snapshot and before the TRUNCATE was destroyed
+  without reaching `main` — silent data loss (production 2026-10-06
+  22:41:18–22: the merge worker rebuilt `vp_1393_main_new`
+  (`kg/related_to`) while a backfill inserted `related_to`; 78 freshly
+  inserted triples vanished with no row and no tombstone; a 40P01 deadlock
+  was logged in the same window). Tombstones had the same defect: with the
+  default `tombstone_retention_seconds = 0` they were TRUNCATEd, undoing
+  deletes that arrived mid-merge; the `i <= max_sid_at_snapshot` branch was
+  unsound because sequences are not transactional. The merge now:
+  serialises per predicate on its advisory key (`0x5052_5000 + id`) for
+  the whole merge, so overlapping merges of one predicate (worker with
+  `merge_workers = 1`, `compact()`) can no longer copy rows twice and
+  then drop both copies; snapshots delta and tombstones into private temp
+  tables and builds `main_new` from them; takes the swap locks in one step
+  (`LOCK` of the VP view, ACCESS EXCLUSIVE, recursing to main/delta/
+  tombstones) with 25 ms attempts and backoff up to
+  `merge_lock_timeout_ms`, never waiting while holding part of them;
+  aborts if `main` was replaced meanwhile; drops from `main_new` any
+  snapshotted delta row a concurrent delete removed; and deletes exactly
+  the snapshotted rows (matched on `s, o, g, i`). Rows written during the
+  merge stay in delta for the next cycle and are included in
+  `triple_count`; `tombstone_count` is set to the surviving tombstones.
+  `merge_all()` merges predicates in id order. Regression: pg_tests in
+  `src/storage/merge_tests.rs` (internal post-build hook).
+- **Not fixed here:** the merge worker still merges every predicate in one
+  transaction, holding each merged predicate's swap locks until the end —
+  a remaining source of write stalls and of 40P01 deadlocks like the one
+  logged in production. Follow-up: one transaction per `merge_predicate`.
+
 ## [0.140.6]
 
 Erasure completeness fix: `erase_subject()` now removes the erased id in
