@@ -6,6 +6,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
+## [0.140.7]
+
+HTAP merge no longer loses rows (or undoes deletes) that commit while a
+merge cycle is running (MERGE-RACE-01).
+
+### Fixed
+
+- **Background merge truncated delta rows it had never merged.**
+  `merge_predicate` (`src/storage/merge.rs`) built `vp_{id}_main_new` from
+  `(main − tombstones) ∪ delta` without a lock and later ran
+  `TRUNCATE vp_{id}_delta`. Under READ COMMITTED every row committed into
+  delta after `main_new`'s snapshot and before the TRUNCATE was destroyed
+  without reaching `main` — silent data loss (production 2026-10-06
+  22:41:18–22: the merge worker rebuilt `vp_1393_main_new`
+  (`kg/related_to`) while a backfill inserted `related_to`; 78 freshly
+  inserted triples vanished with no row and no tombstone; a 40P01 deadlock
+  was logged in the same window). Tombstones had the same defect: with the
+  default `tombstone_retention_seconds = 0` they were TRUNCATEd, undoing
+  deletes that arrived mid-merge; the `i <= max_sid_at_snapshot` branch was
+  unsound because sequences are not transactional. The merge now snapshots
+  delta and tombstones into private temp tables, builds `main_new` from the
+  snapshots, takes an `EXCLUSIVE` lock on delta + tombstones for the swap
+  (before renaming `main`, avoiding the lock-order inversion with writers
+  that read `main`), drops from `main_new` any snapshotted delta row a
+  concurrent delete removed, and deletes exactly the snapshotted rows
+  (matched on `s, o, g, i`). Rows written during the merge stay in delta
+  for the next cycle and are included in `triple_count`. Regression:
+  pg_tests `test_merge_*_mid_merge` in `src/storage/merge.rs` inject the
+  concurrent writes through an internal post-build hook.
+
 ## [0.140.6]
 
 Erasure completeness fix: `erase_subject()` now removes the erased id in

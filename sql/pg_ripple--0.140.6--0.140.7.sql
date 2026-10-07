@@ -1,0 +1,29 @@
+-- Migration 0.140.6 → 0.140.7
+--
+-- MERGE-RACE-01: the HTAP background merge lost rows committed during a
+-- merge cycle.
+--
+-- Defect (Rust only — src/storage/merge.rs): merge_predicate built
+-- vp_{id}_main_new from (main − tombstones) ∪ delta WITHOUT a lock and
+-- later ran `TRUNCATE vp_{id}_delta`.  Under READ COMMITTED every row
+-- committed into delta between main_new's snapshot and the TRUNCATE was
+-- deleted without ever reaching main: silent data loss.  With the default
+-- pg_ripple.tombstone_retention_seconds = 0 the tombstones table was
+-- TRUNCATEd the same way, so deletes arriving mid-merge were undone
+-- (resurrection); the retention > 0 branch used `i <= max_sid_at_snapshot`,
+-- which is unsound because sequences are not transactional.  Production
+-- evidence: 2026-10-06 22:41:18-22, the merge worker rebuilt
+-- vp_1393_main_new (kg/related_to) while a backfill inserted related_to
+-- triples (a 40P01 deadlock was logged in the same window); 78 freshly
+-- inserted related_to triples vanished (no row, no tombstone).
+--
+-- Fix (Rust only): the merge snapshots delta and tombstones into private
+-- temp tables, builds main_new from those snapshots, takes an EXCLUSIVE
+-- lock on delta + tombstones for the swap (before renaming main), drops
+-- from main_new any snapshotted delta row that a concurrent delete removed,
+-- and deletes exactly the snapshotted rows (matched on s, o, g, i) instead
+-- of TRUNCATE.  Rows written during the merge survive to the next cycle.
+--
+-- No SQL objects change.
+-- Regression: pg_tests in src/storage/merge.rs (tests module,
+-- test_merge_*_mid_merge).
