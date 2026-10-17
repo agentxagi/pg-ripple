@@ -14,7 +14,7 @@ provenance by logical triple, not by the caller's statement ID (VAL-391).
 ### Fixed
 
 - **A cross-tenant copy of a derived fact justified as `base` forever.**
-  `build_proof_tree_graph` (`src/datalog/derivations.rs`) looked up
+  `build_proof_tree_graph` (`src/datalog/derivations/graph_scoped.rs`) looked up
   `_pg_ripple.derivations` strictly by the asking graph's SID. A graph
   holding an asserted copy of a derived triple (same s/p/o, its own SID, no
   derivation row — the ValorBrain cross-tenant mirror shape) got `base`
@@ -33,6 +33,19 @@ provenance by logical triple, not by the caller's statement ID (VAL-391).
   `tests/pg_regress/sql/v0147_justify_cross_graph.sql` pins all five
   cases (recording graph, conclusion-only, conclusion+antecedents,
   near-miss antecedents, repeated reads).
+
+### Changed
+
+- **rustls 0.23.45 → 0.23.46** (`Cargo.lock` only) for RUSTSEC-2026-0346
+  (`Debug` impls expose TLS secrets), RUSTSEC-2026-0347 (buffered data sent
+  after ECH rejection), RUSTSEC-2026-0348 (brotli certificate decompression
+  up to 1 GiB) and RUSTSEC-2026-0349 (unauthenticated ServerHello downgrade).
+  rustls reaches the tree through `ureq` (pg_ripple) and `reqwest`
+  (pg_ripple_http).
+- The graph-scoped justify path moved from `src/datalog/derivations.rs` to
+  `src/datalog/derivations/graph_scoped.rs` (file-size gate Q13-04); no
+  behaviour change.
+
 ## [0.140.7]
 
 HTAP merge no longer loses rows (or undoes deletes) that commit while a

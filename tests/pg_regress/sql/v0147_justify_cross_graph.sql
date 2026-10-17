@@ -12,7 +12,7 @@
 -- suite, "both owners get the tree" case); the engine mapped the bare base
 -- proof to `unverified`.
 --
--- Fix under test (build_proof_tree_graph, src/datalog/derivations.rs): when
+-- Fix under test (build_proof_tree_graph, src/datalog/derivations/graph_scoped.rs): when
 -- the node's own row carries no derivation, justify falls back to derivation
 -- rows recorded for ANY materialisation of the same logical triple, with
 -- antecedents re-resolved inside the caller's graph:
