@@ -205,11 +205,18 @@ fn encode_inner(term: &str, kind: i16) -> i64 {
     id
 }
 
-/// Encode a typed literal (`"value"^^<datatype>`) into the dictionary.
-///
-/// For `xsd:integer`, `xsd:boolean`, `xsd:dateTime`, and `xsd:date`, the
-/// value is encoded inline (bit 63 = 1) — no dictionary row is inserted.
-/// All other typed literals are stored in the dictionary as usual.
+/// Canonical dictionary term of a language-tagged literal (`"value"@lang`):
+/// the one form `encode_lang_literal` stores and the lookups find.
+fn lang_literal_term(value: &str, lang: &str) -> String {
+    format!("\"{}\"@{}", value, lang)
+}
+
+/// Canonical dictionary term of a typed literal (`"value"^^<datatype>`): the
+/// one form `encode_typed_literal` stores and the lookups find.
+fn typed_literal_term(value: &str, datatype: &str) -> String {
+    format!("\"{}\"^^<{}>", value, datatype)
+}
+
 /// Inline id of a typed literal when its datatype has an inline encoding
 /// (integer family, boolean, dateTime, date). Pure: no dictionary access.
 fn inline_typed_literal(value: &str, datatype: &str) -> Option<i64> {
@@ -232,6 +239,11 @@ fn inline_typed_literal(value: &str, datatype: &str) -> Option<i64> {
     }
 }
 
+/// Encode a typed literal (`"value"^^<datatype>`) into the dictionary.
+///
+/// For `xsd:integer`, `xsd:boolean`, `xsd:dateTime`, and `xsd:date`, the
+/// value is encoded inline (bit 63 = 1) — no dictionary row is inserted.
+/// All other typed literals are stored in the dictionary as usual.
 pub fn encode_typed_literal(value: &str, datatype: &str) -> i64 {
     // Fast path: try inline encoding for supported numeric / date types.
     if let Some(id) = inline_typed_literal(value, datatype) {
@@ -239,7 +251,7 @@ pub fn encode_typed_literal(value: &str, datatype: &str) -> i64 {
     }
 
     // Build canonical form for hashing.
-    let canonical = format!("\"{}\"^^<{}>", value, datatype);
+    let canonical = typed_literal_term(value, datatype);
     let hash128 = term_hash(&canonical, KIND_TYPED_LITERAL);
 
     // Tier 1: shared-memory encode cache.
@@ -287,7 +299,7 @@ pub fn encode_typed_literal(value: &str, datatype: &str) -> i64 {
 
 /// Encode a language-tagged literal (`"value"@lang`) into the dictionary.
 pub fn encode_lang_literal(value: &str, lang: &str) -> i64 {
-    let canonical = format!("\"{}\"@{}", value, lang);
+    let canonical = lang_literal_term(value, lang);
     let hash128 = term_hash(&canonical, KIND_LANG_LITERAL);
 
     // Tier 1: shared-memory encode cache.
@@ -700,7 +712,7 @@ pub fn lookup_plain_literal(value: &str) -> Option<i64> {
 /// Look up a language-tagged literal without inserting (same canonical form
 /// as `encode_lang_literal`).
 pub fn lookup_lang_literal(value: &str, lang: &str) -> Option<i64> {
-    lookup(&format!("\"{}\"@{}", value, lang), KIND_LANG_LITERAL)
+    lookup(&lang_literal_term(value, lang), KIND_LANG_LITERAL)
 }
 
 /// Look up a typed literal without inserting: the inline encoding first, as
@@ -709,10 +721,33 @@ pub fn lookup_typed_literal(value: &str, datatype: &str) -> Option<i64> {
     if let Some(id) = inline_typed_literal(value, datatype) {
         return Some(id);
     }
-    lookup(
-        &format!("\"{}\"^^<{}>", value, datatype),
-        KIND_TYPED_LITERAL,
+    lookup(&typed_literal_term(value, datatype), KIND_TYPED_LITERAL)
+}
+
+/// SQL that finds a term's dictionary id when the statement runs, by the hash
+/// `lookup` uses: the id once the term is stored, `NULL` before (so `col = …`
+/// matches nothing). For a term a query names that the dictionary does not
+/// hold yet (FB-0278): the query must not write it, and SQL kept for later —
+/// by the plan cache or by a view — must still match the term once it is
+/// stored, which a `FALSE` frozen at translation would not (review of #29).
+/// It needs only SELECT on `_pg_ripple.dictionary`.
+pub fn lookup_sql(term: &str, kind: i16) -> String {
+    let hash128 = term_hash(term, kind);
+    let hash_hi = (hash128 >> 64) as i64;
+    let hash_lo = hash128 as i64;
+    format!(
+        "(SELECT id FROM _pg_ripple.dictionary WHERE hash_hi = {hash_hi} AND hash_lo = {hash_lo})"
     )
+}
+
+/// `lookup_sql` for a language-tagged literal.
+pub fn lang_literal_lookup_sql(value: &str, lang: &str) -> String {
+    lookup_sql(&lang_literal_term(value, lang), KIND_LANG_LITERAL)
+}
+
+/// `lookup_sql` for a typed literal that has no inline encoding.
+pub fn typed_literal_lookup_sql(value: &str, datatype: &str) -> String {
+    lookup_sql(&typed_literal_term(value, datatype), KIND_TYPED_LITERAL)
 }
 
 /// Return `true` if `id` is a blank-node dictionary entry.

@@ -10,10 +10,13 @@
 -- IRIs were already looked up read-only (a never-stored IRI matches nothing).
 --
 -- The fix looks literals up the same way in triple patterns: plain,
--- language-tagged and typed (inline encoding first), and a literal that was
--- never stored matches no triple.  This test pins it: stored literals still
--- match, unknown ones answer false, the dictionary does not grow, and a
--- read-only role gets an answer instead of the error.
+-- language-tagged and typed (inline encoding first).  A literal not stored yet
+-- becomes SQL that finds its id when the query runs, so a SELECT plan cached
+-- before the literal is stored still matches it afterwards (review of #29).
+-- This test pins it: stored literals still match (on a fresh connection, so
+-- the lookup reads the dictionary table), unknown ones answer false, the
+-- dictionary does not grow, the cached SELECT sees a literal stored later,
+-- and a read-only role gets answers instead of the error.
 -- Deterministic library load (v0145 pattern).
 SET client_min_messages TO error;
 CREATE EXTENSION IF NOT EXISTS pg_ripple;
@@ -36,6 +39,11 @@ SELECT pg_ripple.load_ntriples_into_graph(
               4
 (1 row)
 
+-- A fresh connection: the lookups below read the dictionary table, as in
+-- production, not the backend cache the load filled.
+\c
+SET client_min_messages TO error;
+SET search_path TO pg_ripple, public;
 -- Stored literals still match, each kind on its own path.
 SELECT pg_ripple.sparql_ask($$ASK { GRAPH <http://fb0278.test/g> { <http://fb0278.test/s> <http://fb0278.test/plain> "valor gravado" } }$$) AS plain_known;
  plain_known 
@@ -93,14 +101,51 @@ SELECT (SELECT count(*) FROM _pg_ripple.dictionary) - n AS dictionary_growth FRO
                  0
 (1 row)
 
--- The production case: a role that only reads _pg_ripple asks for a literal
--- it has never seen.  Before the fix: ERROR permission denied for table dictionary.
--- (Only the unknown literal: what the reader sees of stored triples depends on
--- graph access state left by earlier tests in the shared regress database.)
+-- SELECT goes through the plan cache (ASK does not): a literal not stored yet
+-- must not freeze FALSE in the cached plan.  Same SELECT, same connection,
+-- before and after the literal is stored: 0, then 1 (review of #29).
+SELECT count(*) AS select_before FROM pg_ripple.sparql($$SELECT ?s WHERE { GRAPH <http://fb0278.test/g> { ?s <http://fb0278.test/plain> "chega depois" } }$$);
+ select_before 
+---------------
+             0
+(1 row)
+
+SELECT pg_ripple.load_ntriples_into_graph(E'<http://fb0278.test/s2> <http://fb0278.test/plain> "chega depois" .\n', 'http://fb0278.test/g') AS late_load;
+ late_load 
+-----------
+         1
+(1 row)
+
+SELECT count(*) AS select_after FROM pg_ripple.sparql($$SELECT ?s WHERE { GRAPH <http://fb0278.test/g> { ?s <http://fb0278.test/plain> "chega depois" } }$$);
+ select_after 
+--------------
+            1
+(1 row)
+
+-- The production case: a role that only reads _pg_ripple asks for literals,
+-- on a fresh connection.  Before the fix: ERROR permission denied for table
+-- dictionary, for a stored literal as well as for one never seen.  The graph
+-- grant makes what the reader sees independent of the graph access state
+-- earlier tests leave in the shared regress database.
 CREATE ROLE fb0278_reader NOLOGIN;
 GRANT USAGE ON SCHEMA pg_ripple, _pg_ripple TO fb0278_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA _pg_ripple TO fb0278_reader;
+SELECT pg_ripple.grant_graph_permission('fb0278_reader', '<http://fb0278.test/g>', 'read');
+ grant_graph_permission 
+------------------------
+ 
+(1 row)
+
+\c
+SET client_min_messages TO error;
+SET search_path TO pg_ripple, public;
 SET ROLE fb0278_reader;
+SELECT pg_ripple.sparql_ask($$ASK { GRAPH <http://fb0278.test/g> { <http://fb0278.test/s> <http://fb0278.test/plain> "valor gravado" } }$$) AS reader_known;
+ reader_known 
+--------------
+ t
+(1 row)
+
 SELECT pg_ripple.sparql_ask($$ASK { GRAPH <http://fb0278.test/g> { <http://fb0278.test/s> <http://fb0278.test/plain> "outro valor nunca gravado" } }$$) AS reader_unknown;
  reader_unknown 
 ----------------
@@ -108,6 +153,12 @@ SELECT pg_ripple.sparql_ask($$ASK { GRAPH <http://fb0278.test/g> { <http://fb027
 (1 row)
 
 RESET ROLE;
+SELECT pg_ripple.revoke_graph_permission('fb0278_reader', '<http://fb0278.test/g>');
+ revoke_graph_permission 
+-------------------------
+ 
+(1 row)
+
 REVOKE SELECT ON ALL TABLES IN SCHEMA _pg_ripple FROM fb0278_reader;
 REVOKE USAGE ON SCHEMA pg_ripple, _pg_ripple FROM fb0278_reader;
 DROP ROLE fb0278_reader;

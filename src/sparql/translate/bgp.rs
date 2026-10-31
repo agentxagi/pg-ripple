@@ -69,12 +69,12 @@ pub(crate) fn bind_term(
             Some(id) => conditions.push(format!("{col_expr} = {id}")),
             None => conditions.push("FALSE".to_owned()),
         },
-        // Read-only (FB-0278), like the IRI above: a query must not write the
-        // dictionary, and a literal that was never stored matches no triple.
-        TermPattern::Literal(lit) => match ctx.lookup_literal(lit) {
-            Some(id) => conditions.push(format!("{col_expr} = {id}")),
-            None => conditions.push("FALSE".to_owned()),
-        },
+        // Read-only (FB-0278): a query must not write the dictionary. A
+        // literal not stored yet is found when the SQL runs (literal_id_sql).
+        TermPattern::Literal(lit) => {
+            let id = ctx.literal_id_sql(lit);
+            conditions.push(format!("{col_expr} = {id}"));
+        }
         TermPattern::BlankNode(bnode) => {
             // BN-SCOPE-01 (v0.81.0): prefix blank-node variable names with the
             // per-query scope prefix so that blank nodes from different subqueries
@@ -118,10 +118,10 @@ pub(crate) fn bind_term(
                                     Some(id) => conds.push(format!("{dict_col} = {id}")),
                                     None => conds.push("FALSE".to_owned()),
                                 },
-                                TermPattern::Literal(lit) => match ctx.lookup_literal(lit) {
-                                    Some(id) => conds.push(format!("{dict_col} = {id}")),
-                                    None => conds.push("FALSE".to_owned()),
-                                },
+                                TermPattern::Literal(lit) => {
+                                    let id = ctx.literal_id_sql(lit);
+                                    conds.push(format!("{dict_col} = {id}"));
+                                }
                                 TermPattern::Variable(v) => {
                                     bnd.push((v.as_str().to_owned(), dict_col.to_owned()));
                                 }

@@ -356,12 +356,22 @@ impl Ctx {
         id
     }
 
-    /// Look up a `spargebra::Literal` without inserting (FB-0278).
-    /// `None`: the literal was never stored, so no triple holds it.
+    /// Look up a `spargebra::Literal` without inserting (FB-0278), once per
+    /// query (`per_query`; the key starts with a control character, which no
+    /// IRI key has). `None`: the literal is not stored now.
     pub(crate) fn lookup_literal(&mut self, lit: &Literal) -> Option<i64> {
         let value = lit.value();
         let dt = lit.datatype().as_str();
-        if let Some(l) = lit.language() {
+        let key = format!(
+            "\u{1}{}\u{1}{}\u{1}{}",
+            dt,
+            lit.language().unwrap_or(""),
+            value
+        );
+        if let Some(cached) = self.per_query.get(&key) {
+            return *cached;
+        }
+        let id = if let Some(l) = lit.language() {
             dictionary::lookup_lang_literal(value, l)
         } else if dt == "http://www.w3.org/2001/XMLSchema#string"
             || dt == "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
@@ -369,6 +379,30 @@ impl Ctx {
             dictionary::lookup_plain_literal(value)
         } else {
             dictionary::lookup_typed_literal(value, dt)
+        };
+        self.per_query.insert(key, id);
+        id
+    }
+
+    /// SQL for a literal's id in a triple pattern, without writing (FB-0278):
+    /// the id when the literal is inline or stored; otherwise SQL that finds
+    /// it when the query runs. A `FALSE` there would freeze in the plan cache
+    /// and in a view's SQL, and the literal stored later would never match
+    /// (review of #29); `encode` used to avoid that by writing the literal.
+    pub(crate) fn literal_id_sql(&mut self, lit: &Literal) -> String {
+        if let Some(id) = self.lookup_literal(lit) {
+            return id.to_string();
+        }
+        let value = lit.value();
+        let dt = lit.datatype().as_str();
+        if let Some(l) = lit.language() {
+            dictionary::lang_literal_lookup_sql(value, l)
+        } else if dt == "http://www.w3.org/2001/XMLSchema#string"
+            || dt == "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+        {
+            dictionary::lookup_sql(value, dictionary::KIND_LITERAL)
+        } else {
+            dictionary::typed_literal_lookup_sql(value, dt)
         }
     }
 

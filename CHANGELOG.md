@@ -19,10 +19,19 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   "literal" } }`, about 40 times a day (FB-0278). Triple patterns (including
   quoted-triple components) now look literals up read-only, like IRIs:
   `dictionary::lookup_plain_literal`, `lookup_lang_literal` and
-  `lookup_typed_literal` (inline encoding first), and a literal that was never
-  stored matches nothing. A read-only query no longer grows the dictionary.
-  Property-path endpoints and FILTER expressions still encode literals; no SQL
-  change, the extension stays at 0.141.0. Test: `v0147b_literal_lookup_readonly`.
+  `lookup_typed_literal` (inline encoding first). A literal not stored yet
+  becomes SQL that finds its id when the query runs
+  (`dictionary::lookup_sql`, SELECT only), not a `FALSE` frozen at
+  translation: a SELECT plan cached, or a view's SQL kept, before the literal
+  is stored still matches it afterwards, as the old encode did by writing it.
+  A read-only query no longer grows the dictionary. Still writing on the query
+  path: property-path endpoints, FILTER expressions, VALUES, BIND and
+  function arguments, CONSTRUCT template constants and SERVICE results. The
+  canonical literal forms now have one source (`lang_literal_term`,
+  `typed_literal_term`) for encode and lookup. No SQL change, the extension
+  stays at 0.141.0. Test: `v0147b_literal_lookup_readonly` (stored literals on
+  a fresh connection, the cached SELECT before and after a late load, and a
+  read-only role asking for stored and unknown literals).
 
 ## [0.141.0]
 
