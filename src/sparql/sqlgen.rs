@@ -356,6 +356,22 @@ impl Ctx {
         id
     }
 
+    /// Look up a `spargebra::Literal` without inserting (FB-0278).
+    /// `None`: the literal was never stored, so no triple holds it.
+    pub(crate) fn lookup_literal(&mut self, lit: &Literal) -> Option<i64> {
+        let value = lit.value();
+        let dt = lit.datatype().as_str();
+        if let Some(l) = lit.language() {
+            dictionary::lookup_lang_literal(value, l)
+        } else if dt == "http://www.w3.org/2001/XMLSchema#string"
+            || dt == "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+        {
+            dictionary::lookup_plain_literal(value)
+        } else {
+            dictionary::lookup_typed_literal(value, dt)
+        }
+    }
+
     /// Encode a `spargebra::Literal` to a dictionary id (may insert).
     pub(crate) fn encode_literal(&mut self, lit: &Literal) -> i64 {
         let lang = lit.language();

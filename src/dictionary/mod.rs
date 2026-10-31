@@ -210,9 +210,10 @@ fn encode_inner(term: &str, kind: i16) -> i64 {
 /// For `xsd:integer`, `xsd:boolean`, `xsd:dateTime`, and `xsd:date`, the
 /// value is encoded inline (bit 63 = 1) — no dictionary row is inserted.
 /// All other typed literals are stored in the dictionary as usual.
-pub fn encode_typed_literal(value: &str, datatype: &str) -> i64 {
-    // Fast path: try inline encoding for supported numeric / date types.
-    let inline_id = match datatype {
+/// Inline id of a typed literal when its datatype has an inline encoding
+/// (integer family, boolean, dateTime, date). Pure: no dictionary access.
+fn inline_typed_literal(value: &str, datatype: &str) -> Option<i64> {
+    match datatype {
         "http://www.w3.org/2001/XMLSchema#integer"
         | "http://www.w3.org/2001/XMLSchema#long"
         | "http://www.w3.org/2001/XMLSchema#int"
@@ -228,8 +229,12 @@ pub fn encode_typed_literal(value: &str, datatype: &str) -> i64 {
         "http://www.w3.org/2001/XMLSchema#dateTime" => inline::try_encode_datetime(value),
         "http://www.w3.org/2001/XMLSchema#date" => inline::try_encode_date(value),
         _ => None,
-    };
-    if let Some(id) = inline_id {
+    }
+}
+
+pub fn encode_typed_literal(value: &str, datatype: &str) -> i64 {
+    // Fast path: try inline encoding for supported numeric / date types.
+    if let Some(id) = inline_typed_literal(value, datatype) {
         return id;
     }
 
@@ -677,6 +682,34 @@ pub fn lookup(term: &str, kind: i16) -> Option<i64> {
 /// Look up an IRI (kind=0) without inserting.
 pub fn lookup_iri(iri: &str) -> Option<i64> {
     lookup(iri, KIND_IRI)
+}
+
+/// Look up a plain literal (`xsd:string`) without inserting: the read side of
+/// `encode(value, KIND_LITERAL)`.
+///
+/// A SPARQL query must not write the dictionary. The ValorBrain app role only
+/// reads `_pg_ripple`, and an ASK with a literal object failed with
+/// "permission denied for table dictionary" whenever the literal was not in
+/// the shared cache, even when it was already stored (FB-0278): the encode
+/// path runs an INSERT ... ON CONFLICT, which needs the INSERT privilege
+/// either way. A literal that was never stored matches no triple.
+pub fn lookup_plain_literal(value: &str) -> Option<i64> {
+    lookup(value, KIND_LITERAL)
+}
+
+/// Look up a language-tagged literal without inserting (same canonical form
+/// as `encode_lang_literal`).
+pub fn lookup_lang_literal(value: &str, lang: &str) -> Option<i64> {
+    lookup(&format!("\"{}\"@{}", value, lang), KIND_LANG_LITERAL)
+}
+
+/// Look up a typed literal without inserting: the inline encoding first, as
+/// `encode_typed_literal` does, then the same canonical form.
+pub fn lookup_typed_literal(value: &str, datatype: &str) -> Option<i64> {
+    if let Some(id) = inline_typed_literal(value, datatype) {
+        return Some(id);
+    }
+    lookup(&format!("\"{}\"^^<{}>", value, datatype), KIND_TYPED_LITERAL)
 }
 
 /// Return `true` if `id` is a blank-node dictionary entry.
