@@ -709,7 +709,10 @@ pub fn lookup_typed_literal(value: &str, datatype: &str) -> Option<i64> {
     if let Some(id) = inline_typed_literal(value, datatype) {
         return Some(id);
     }
-    lookup(&format!("\"{}\"^^<{}>", value, datatype), KIND_TYPED_LITERAL)
+    lookup(
+        &format!("\"{}\"^^<{}>", value, datatype),
+        KIND_TYPED_LITERAL,
+    )
 }
 
 /// Return `true` if `id` is a blank-node dictionary entry.
