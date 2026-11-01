@@ -10,6 +10,24 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ### Fixed
 
+- **A SELECT cached while one of its IRIs was not stored kept answering from
+  that moment.** The translator looks IRIs up read-only, and a subject,
+  object, predicate or graph that was never stored makes its pattern `FALSE`
+  in the generated SQL: right when the query runs, wrong once the IRI is
+  stored. `pg_ripple.sparql()` caches the SQL per backend by query text, so
+  the same query on the same connection kept the `FALSE` until the entry was
+  evicted or the backend ended. In ValorBrain, the one-hop query
+  `SELECT ?p ?o WHERE { GRAPH <g> { <entity> ?p ?o } }` runs on pooled
+  connections that live for hours: an entity asked about before it was synced
+  stayed without neighbours on that connection. `prepare_select` no longer
+  caches a translation that saw an unknown IRI (`Ctx::saw_unknown_iri`), as it
+  already skips SERVICE queries; the IRI is looked up again on the next run.
+  Queries whose IRIs are all stored are cached as before. ASK through
+  `sparql()` was translated on every call and is unchanged. No SQL change.
+  Test: `v0147c_iri_unknown_plan_cache` (unknown subject, object, predicate
+  and graph, each run twice before a late load and once after, on one
+  connection).
+
 - **A SPARQL query with a literal in a triple pattern needed INSERT on the
   dictionary.** The translator encoded a literal object with
   `dictionary::encode`, whose cache miss runs `INSERT ... ON CONFLICT DO

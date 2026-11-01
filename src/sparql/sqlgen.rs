@@ -356,6 +356,17 @@ impl Ctx {
         id
     }
 
+    /// Whether `encode_iri` found an IRI that is not stored: its pattern is
+    /// `FALSE` in the SQL, right now and wrong once the IRI is stored, so
+    /// `prepare_select` does not cache the translation.  Literal keys start
+    /// with a control character (`lookup_literal`); an unknown literal becomes
+    /// a lookup that runs with the query instead (`literal_id_sql`).
+    pub(crate) fn saw_unknown_iri(&self) -> bool {
+        self.per_query
+            .iter()
+            .any(|(key, id)| id.is_none() && !key.starts_with('\u{1}'))
+    }
+
     /// Look up a `spargebra::Literal` without inserting (FB-0278), once per
     /// query (`per_query`; the key starts with a control character, which no
     /// IRI key has). `None`: the literal is not stored now.
@@ -733,6 +744,9 @@ pub struct Translation {
     /// activated the Leapfrog-Triejoin execution path.  The query executor
     /// must run `wcoj_session_preamble()` before executing the SQL.
     pub wcoj_preamble: bool,
+    /// True when an IRI of the query is not stored (`Ctx::saw_unknown_iri`):
+    /// the SQL answers for now and must not be cached.
+    pub saw_unknown_iri: bool,
 }
 
 /// Translate a SPARQL SELECT query pattern to SQL.
@@ -848,6 +862,7 @@ pub fn translate_select(pattern: &GraphPattern, base_iri: Option<&str>) -> Trans
     // v0.62.0: if a cyclic BGP was detected during translation, wrap the SQL
     // with the WCOJ materialized-CTE hint so the planner uses sort-merge joins.
     let wcoj_preamble = ctx.wcoj_preamble;
+    let saw_unknown_iri = ctx.saw_unknown_iri();
     let sql = if wcoj_preamble {
         crate::sparql::wcoj::apply_wcoj_hints(&sql)
     } else {
@@ -863,6 +878,7 @@ pub fn translate_select(pattern: &GraphPattern, base_iri: Option<&str>) -> Trans
         raw_double_vars: ctx.raw_double_vars,
         topn_applied,
         wcoj_preamble,
+        saw_unknown_iri,
     }
 }
 

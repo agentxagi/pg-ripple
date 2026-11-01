@@ -67,6 +67,7 @@ pub(crate) fn prepare_select(
     check_query_complexity(&pattern);
 
     let trans = sqlgen::translate_select(&pattern, base_iri.as_deref());
+    let saw_unknown_iri = trans.saw_unknown_iri;
     let entry = (
         trans.sql,
         trans.variables,
@@ -78,8 +79,10 @@ pub(crate) fn prepare_select(
     );
     // Skip plan cache for queries that contain SERVICE clauses — remote results
     // are baked into the generated SQL as VALUES literals; caching would return
-    // stale data from a previous execution.
-    if !canonical.to_ascii_uppercase().contains("SERVICE") {
+    // stale data from a previous execution.  Nor when an IRI of the query is
+    // not stored yet: its pattern is FALSE in this SQL, and the same query
+    // must match once the IRI is stored (a backend lives for hours in a pool).
+    if !saw_unknown_iri && !canonical.to_ascii_uppercase().contains("SERVICE") {
         plan_cache::put_canonical(&canonical, entry.clone());
     }
     entry
