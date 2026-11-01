@@ -16,7 +16,8 @@ use crate::sparql::translate::filter::sanitize_sql_ident;
 pub(crate) fn ground_term_id(term: &TermPattern, ctx: &mut Ctx) -> Option<i64> {
     match term {
         TermPattern::NamedNode(nn) => ctx.encode_iri(nn.as_str()),
-        TermPattern::Literal(lit) => Some(ctx.encode_literal(lit)),
+        // Read-only (FB-0278): a literal never stored matches nothing.
+        TermPattern::Literal(lit) => ctx.lookup_literal(lit),
         TermPattern::Triple(inner) => {
             let s_id = ground_term_id(&inner.subject, ctx)?;
             let p_id = match &inner.predicate {
@@ -68,8 +69,10 @@ pub(crate) fn bind_term(
             Some(id) => conditions.push(format!("{col_expr} = {id}")),
             None => conditions.push("FALSE".to_owned()),
         },
+        // Read-only (FB-0278): a query must not write the dictionary. A
+        // literal not stored yet is found when the SQL runs (literal_id_sql).
         TermPattern::Literal(lit) => {
-            let id = ctx.encode_literal(lit);
+            let id = ctx.literal_id_sql(lit);
             conditions.push(format!("{col_expr} = {id}"));
         }
         TermPattern::BlankNode(bnode) => {
@@ -116,7 +119,7 @@ pub(crate) fn bind_term(
                                     None => conds.push("FALSE".to_owned()),
                                 },
                                 TermPattern::Literal(lit) => {
-                                    let id = ctx.encode_literal(lit);
+                                    let id = ctx.literal_id_sql(lit);
                                     conds.push(format!("{dict_col} = {id}"));
                                 }
                                 TermPattern::Variable(v) => {
