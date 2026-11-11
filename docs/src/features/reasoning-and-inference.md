@@ -33,7 +33,7 @@ Derived triples are stored with `source = 1` (inferred) alongside explicit tripl
 
 1. **Parse** — rules are parsed from a Turtle-flavoured Datalog syntax into an internal Rule IR.
 2. **Stratify** — the dependency graph is analyzed; rules are grouped into strata such that negated predicates are fully computed in lower strata.
-3. **Compile** — each stratum is compiled to PostgreSQL SQL: non-recursive rules become `INSERT ... SELECT`, recursive rules become `WITH RECURSIVE ... CYCLE`.
+3. **Compile** — each stratum is compiled to PostgreSQL SQL: non-recursive rules become `INSERT ... SELECT`, recursive rules become `WITH RECURSIVE ... UNION` (set semantics, which terminates on cyclic graphs).
 4. **Execute** — strata run bottom-up; each stratum's SQL is executed via SPI, inserting derived triples into VP delta tables.
 5. **Fixpoint** — recursive strata iterate until no new facts are derived (semi-naive evaluation).
 

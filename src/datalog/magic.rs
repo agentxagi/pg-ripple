@@ -668,30 +668,25 @@ fn build_magic_filtered_seed_sql(
     if extra_conditions.is_empty() {
         base_sql
     } else {
-        // Wrap the INSERT...SELECT in a CTE and add the extra filter.
+        // Filter the rows the rule outputs, not its body: the outer SELECT
+        // follows the INSERT into the known target (a recursive rule puts a
+        // WITH RECURSIVE before it, and every VP read expression carries its
+        // own WHERE), and it is wrapped in a subquery with positional column
+        // names so the filter never depends on how the SELECT is written.
         let filter_str = extra_conditions.join(" AND ");
-        // The base SQL ends with "ON CONFLICT DO NOTHING".
-        // We need to inject the filter before ON CONFLICT.
-        // Simple approach: wrap in a subquery.
-        let (insert_part, select_part) = if let Some(pos) = base_sql.find("SELECT ") {
-            let insert = &base_sql[..pos];
-            let select = &base_sql[pos..];
-            (insert.to_owned(), select.to_owned())
-        } else {
+        let insert_head = format!("INSERT INTO {target} (s, o, g)");
+        let Some(insert_pos) = base_sql.find(&insert_head) else {
             return base_sql;
         };
-
-        // Remove the trailing "ON CONFLICT DO NOTHING" to add a WHERE clause.
-        let select_no_conflict = select_part
-            .trim_end_matches('\n')
-            .trim_end()
+        let select = base_sql[insert_pos + insert_head.len()..]
+            .trim()
             .trim_end_matches("ON CONFLICT DO NOTHING")
             .trim_end();
-
-        let has_where = select_no_conflict.contains("WHERE ");
-        let joiner = if has_where { "\n  AND " } else { "\nWHERE " };
-
-        format!("{insert_part}{select_no_conflict}{joiner}{filter_str}\nON CONFLICT DO NOTHING")
+        format!(
+            "{prefix}{insert_head}\nSELECT s, o, g FROM (\n{select}\n) AS _goal (s, o, g)\n\
+             WHERE {filter_str}\nON CONFLICT DO NOTHING",
+            prefix = &base_sql[..insert_pos]
+        )
     }
 }
 

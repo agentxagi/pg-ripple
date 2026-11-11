@@ -75,11 +75,8 @@ pub(super) fn compile_recursive_rule(
         }
     }
 
-    // Build base SQL.  When there are multiple base predicates we must NOT
-    // join them with a bare UNION at the top level, because PostgreSQL's
-    // CYCLE clause requires the left side of the outer UNION to be a plain
-    // SELECT — a SetOperationStmt on the left triggers "the left side of the
-    // UNION must be a SELECT".  Wrap in a subquery instead.
+    // Build base SQL.  Multiple base predicates are wrapped in one derived
+    // table so the non-recursive term of the CTE stays a single SELECT.
     let base_sql = if base_selects.is_empty() {
         // Seed from the current VP table.  Use alias _vp so PostgreSQL
         // accepts the derived-table expression.
@@ -130,9 +127,11 @@ pub(super) fn compile_recursive_rule(
         )
     };
 
-    let has_graph_var = matches!(&head.g, Term::Var(_));
-    let cycle_cols = if has_graph_var { "s, o, g" } else { "s, o" };
-
+    // No CYCLE clause: CYCLE adds the path to every row, so UNION keeps one
+    // row per distinct path and the recursion enumerates every simple path of
+    // the graph instead of the closure (exponential on cyclic graphs).  Plain
+    // UNION discards rows already produced, so the recursion stops once no
+    // new (s, o, g) appears.
     let select_s = match &head.s {
         Term::Var(_) => format!("{cte_name}.s"),
         Term::Const(id) => const_sql(*id),
@@ -168,17 +167,18 @@ pub(super) fn compile_recursive_rule(
             ("s, o, g", "")
         };
 
+        // Rows are distinct per (s, o, g, depth), so the CTE holds at most
+        // (max_depth + 1) rows per derived triple and stops at max_depth.
+        // DISTINCT keeps one insert attempt per triple.
         Ok(format!(
             "WITH RECURSIVE {cte_name}(s, o, g, depth) AS (\n\
                  {base_sql_depth}\n\
                UNION\n\
                  {rec_sql_depth}\n\
              )\n\
-             CYCLE {cycle_cols} SET is_cycle USING cycle_path\n\
              INSERT INTO {target} ({head_cols})\n\
-             SELECT {select_s}, {select_o}, {cte_name}.g{head_source}\n\
+             SELECT DISTINCT {select_s}, {select_o}, {cte_name}.g{head_source}\n\
              FROM {cte_name}\n\
-             WHERE NOT is_cycle\n\
              ON CONFLICT DO NOTHING"
         ))
     } else {
@@ -195,11 +195,9 @@ pub(super) fn compile_recursive_rule(
                UNION\n\
                  {rec_sql}\n\
              )\n\
-             CYCLE {cycle_cols} SET is_cycle USING cycle_path\n\
              INSERT INTO {target} ({head_cols})\n\
              SELECT {select_s}, {select_o}, {cte_name}.g{head_source}\n\
              FROM {cte_name}\n\
-             WHERE NOT is_cycle\n\
              ON CONFLICT DO NOTHING"
         ))
     }
@@ -297,8 +295,8 @@ fn compile_recursive_cte_fragment(
     } else {
         ""
     };
-    let cycle_cols = if has_graph_var { "s, o, g" } else { "s, o" };
 
+    // Set-semantics UNION, no CYCLE clause (see compile_recursive_rule).
     Ok(format!(
         "WITH RECURSIVE {cte_name}(s, o, g) AS (\n\
              {base_sql}\n\
@@ -306,8 +304,7 @@ fn compile_recursive_cte_fragment(
              SELECT base.s, r.o, base.g\n\
              FROM {} base\n\
              JOIN {cte_name} r ON r.s = base.o {join_g}\n\
-         )\n\
-         CYCLE {cycle_cols} SET is_cycle USING cycle_path",
+         )",
         vp_read_expr(base_pred)
     ))
 }
@@ -835,3 +832,7 @@ pub fn compile_aggregate_rule(rule: &Rule, target: &str) -> Result<String, Strin
         source = vp_read_expr(pred_id)
     ))
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[path = "sql_tests.rs"]
+mod sql_tests;
