@@ -34,6 +34,47 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   nothing) and the pg_test
   `test_on_demand_cte_is_set_closure_on_cyclic_graph`.
 
+- **A SELECT cached while one of its IRIs was not stored kept answering from
+  that moment.** The translator looks IRIs up read-only, and a subject,
+  object, predicate or graph that was never stored makes its pattern `FALSE`
+  in the generated SQL: right when the query runs, wrong once the IRI is
+  stored. `pg_ripple.sparql()` caches the SQL per backend by query text, so
+  the same query on the same connection kept the `FALSE` until the entry was
+  evicted or the backend ended. In ValorBrain, the one-hop query
+  `SELECT ?p ?o WHERE { GRAPH <g> { <entity> ?p ?o } }` runs on pooled
+  connections that live for hours: an entity asked about before it was synced
+  stayed without neighbours on that connection. `prepare_select` no longer
+  caches a translation that saw an unknown IRI (`Ctx::saw_unknown_iri`), as it
+  already skips SERVICE queries; the IRI is looked up again on the next run.
+  Queries whose IRIs are all stored are cached as before. ASK through
+  `sparql()` was translated on every call and is unchanged. No SQL change.
+  Test: `v0147c_iri_unknown_plan_cache` (unknown subject, object, predicate
+  and graph, each run twice before a late load and once after, on one
+  connection).
+
+- **A SPARQL query with a literal in a triple pattern needed INSERT on the
+  dictionary.** The translator encoded a literal object with
+  `dictionary::encode`, whose cache miss runs `INSERT ... ON CONFLICT DO
+  NOTHING`; the INSERT privilege is checked even when the literal is already
+  stored. A role that only reads `_pg_ripple` (the ValorBrain app role) got
+  `permission denied for table dictionary` on `ASK { GRAPH <g> { <s> <p>
+  "literal" } }`, about 40 times a day (FB-0278). Triple patterns (including
+  quoted-triple components) now look literals up read-only, like IRIs:
+  `dictionary::lookup_plain_literal`, `lookup_lang_literal` and
+  `lookup_typed_literal` (inline encoding first). A literal not stored yet
+  becomes SQL that finds its id when the query runs
+  (`dictionary::lookup_sql`, SELECT only), not a `FALSE` frozen at
+  translation: a SELECT plan cached, or a view's SQL kept, before the literal
+  is stored still matches it afterwards, as the old encode did by writing it.
+  A read-only query no longer grows the dictionary. Still writing on the query
+  path: property-path endpoints, FILTER expressions, VALUES, BIND and
+  function arguments, CONSTRUCT template constants and SERVICE results. The
+  canonical literal forms now have one source (`lang_literal_term`,
+  `typed_literal_term`) for encode and lookup. No SQL change, the extension
+  stays at 0.141.0. Test: `v0147b_literal_lookup_readonly` (stored literals on
+  a fresh connection, the cached SELECT before and after a late load, and a
+  read-only role asking for stored and unknown literals).
+
 ## [0.141.0]
 
 Cross-graph justification: the graph-scoped `justify(s, p, o, g)` resolves

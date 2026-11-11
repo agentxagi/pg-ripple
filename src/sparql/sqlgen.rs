@@ -356,6 +356,67 @@ impl Ctx {
         id
     }
 
+    /// Whether `encode_iri` found an IRI that is not stored: its pattern is
+    /// `FALSE` in the SQL, right now and wrong once the IRI is stored, so
+    /// `prepare_select` does not cache the translation.  Literal keys start
+    /// with a control character (`lookup_literal`); an unknown literal becomes
+    /// a lookup that runs with the query instead (`literal_id_sql`).
+    pub(crate) fn saw_unknown_iri(&self) -> bool {
+        self.per_query
+            .iter()
+            .any(|(key, id)| id.is_none() && !key.starts_with('\u{1}'))
+    }
+
+    /// Look up a `spargebra::Literal` without inserting (FB-0278), once per
+    /// query (`per_query`; the key starts with a control character, which no
+    /// IRI key has). `None`: the literal is not stored now.
+    pub(crate) fn lookup_literal(&mut self, lit: &Literal) -> Option<i64> {
+        let value = lit.value();
+        let dt = lit.datatype().as_str();
+        let key = format!(
+            "\u{1}{}\u{1}{}\u{1}{}",
+            dt,
+            lit.language().unwrap_or(""),
+            value
+        );
+        if let Some(cached) = self.per_query.get(&key) {
+            return *cached;
+        }
+        let id = if let Some(l) = lit.language() {
+            dictionary::lookup_lang_literal(value, l)
+        } else if dt == "http://www.w3.org/2001/XMLSchema#string"
+            || dt == "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+        {
+            dictionary::lookup_plain_literal(value)
+        } else {
+            dictionary::lookup_typed_literal(value, dt)
+        };
+        self.per_query.insert(key, id);
+        id
+    }
+
+    /// SQL for a literal's id in a triple pattern, without writing (FB-0278):
+    /// the id when the literal is inline or stored; otherwise SQL that finds
+    /// it when the query runs. A `FALSE` there would freeze in the plan cache
+    /// and in a view's SQL, and the literal stored later would never match
+    /// (review of #29); `encode` used to avoid that by writing the literal.
+    pub(crate) fn literal_id_sql(&mut self, lit: &Literal) -> String {
+        if let Some(id) = self.lookup_literal(lit) {
+            return id.to_string();
+        }
+        let value = lit.value();
+        let dt = lit.datatype().as_str();
+        if let Some(l) = lit.language() {
+            dictionary::lang_literal_lookup_sql(value, l)
+        } else if dt == "http://www.w3.org/2001/XMLSchema#string"
+            || dt == "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+        {
+            dictionary::lookup_sql(value, dictionary::KIND_LITERAL)
+        } else {
+            dictionary::typed_literal_lookup_sql(value, dt)
+        }
+    }
+
     /// Encode a `spargebra::Literal` to a dictionary id (may insert).
     pub(crate) fn encode_literal(&mut self, lit: &Literal) -> i64 {
         let lang = lit.language();
@@ -683,6 +744,9 @@ pub struct Translation {
     /// activated the Leapfrog-Triejoin execution path.  The query executor
     /// must run `wcoj_session_preamble()` before executing the SQL.
     pub wcoj_preamble: bool,
+    /// True when an IRI of the query is not stored (`Ctx::saw_unknown_iri`):
+    /// the SQL answers for now and must not be cached.
+    pub saw_unknown_iri: bool,
 }
 
 /// Translate a SPARQL SELECT query pattern to SQL.
@@ -798,6 +862,7 @@ pub fn translate_select(pattern: &GraphPattern, base_iri: Option<&str>) -> Trans
     // v0.62.0: if a cyclic BGP was detected during translation, wrap the SQL
     // with the WCOJ materialized-CTE hint so the planner uses sort-merge joins.
     let wcoj_preamble = ctx.wcoj_preamble;
+    let saw_unknown_iri = ctx.saw_unknown_iri();
     let sql = if wcoj_preamble {
         crate::sparql::wcoj::apply_wcoj_hints(&sql)
     } else {
@@ -813,6 +878,7 @@ pub fn translate_select(pattern: &GraphPattern, base_iri: Option<&str>) -> Trans
         raw_double_vars: ctx.raw_double_vars,
         topn_applied,
         wcoj_preamble,
+        saw_unknown_iri,
     }
 }
 

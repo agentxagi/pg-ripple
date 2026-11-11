@@ -43,6 +43,12 @@
 
 pub mod hot;
 pub mod inline;
+mod lookup;
+
+pub use lookup::{
+    lang_literal_lookup_sql, lookup_lang_literal, lookup_plain_literal, lookup_sql,
+    lookup_typed_literal, typed_literal_lookup_sql,
+};
 
 use lru::LruCache;
 use pgrx::datum::DatumWithOid;
@@ -205,14 +211,22 @@ fn encode_inner(term: &str, kind: i16) -> i64 {
     id
 }
 
-/// Encode a typed literal (`"value"^^<datatype>`) into the dictionary.
-///
-/// For `xsd:integer`, `xsd:boolean`, `xsd:dateTime`, and `xsd:date`, the
-/// value is encoded inline (bit 63 = 1) — no dictionary row is inserted.
-/// All other typed literals are stored in the dictionary as usual.
-pub fn encode_typed_literal(value: &str, datatype: &str) -> i64 {
-    // Fast path: try inline encoding for supported numeric / date types.
-    let inline_id = match datatype {
+/// Canonical dictionary term of a language-tagged literal (`"value"@lang`):
+/// the one form `encode_lang_literal` stores and the lookups find.
+fn lang_literal_term(value: &str, lang: &str) -> String {
+    format!("\"{}\"@{}", value, lang)
+}
+
+/// Canonical dictionary term of a typed literal (`"value"^^<datatype>`): the
+/// one form `encode_typed_literal` stores and the lookups find.
+fn typed_literal_term(value: &str, datatype: &str) -> String {
+    format!("\"{}\"^^<{}>", value, datatype)
+}
+
+/// Inline id of a typed literal when its datatype has an inline encoding
+/// (integer family, boolean, dateTime, date). Pure: no dictionary access.
+fn inline_typed_literal(value: &str, datatype: &str) -> Option<i64> {
+    match datatype {
         "http://www.w3.org/2001/XMLSchema#integer"
         | "http://www.w3.org/2001/XMLSchema#long"
         | "http://www.w3.org/2001/XMLSchema#int"
@@ -228,13 +242,22 @@ pub fn encode_typed_literal(value: &str, datatype: &str) -> i64 {
         "http://www.w3.org/2001/XMLSchema#dateTime" => inline::try_encode_datetime(value),
         "http://www.w3.org/2001/XMLSchema#date" => inline::try_encode_date(value),
         _ => None,
-    };
-    if let Some(id) = inline_id {
+    }
+}
+
+/// Encode a typed literal (`"value"^^<datatype>`) into the dictionary.
+///
+/// For `xsd:integer`, `xsd:boolean`, `xsd:dateTime`, and `xsd:date`, the
+/// value is encoded inline (bit 63 = 1) — no dictionary row is inserted.
+/// All other typed literals are stored in the dictionary as usual.
+pub fn encode_typed_literal(value: &str, datatype: &str) -> i64 {
+    // Fast path: try inline encoding for supported numeric / date types.
+    if let Some(id) = inline_typed_literal(value, datatype) {
         return id;
     }
 
     // Build canonical form for hashing.
-    let canonical = format!("\"{}\"^^<{}>", value, datatype);
+    let canonical = typed_literal_term(value, datatype);
     let hash128 = term_hash(&canonical, KIND_TYPED_LITERAL);
 
     // Tier 1: shared-memory encode cache.
@@ -282,7 +305,7 @@ pub fn encode_typed_literal(value: &str, datatype: &str) -> i64 {
 
 /// Encode a language-tagged literal (`"value"@lang`) into the dictionary.
 pub fn encode_lang_literal(value: &str, lang: &str) -> i64 {
-    let canonical = format!("\"{}\"@{}", value, lang);
+    let canonical = lang_literal_term(value, lang);
     let hash128 = term_hash(&canonical, KIND_LANG_LITERAL);
 
     // Tier 1: shared-memory encode cache.
