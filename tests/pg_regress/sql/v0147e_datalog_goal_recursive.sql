@@ -1,0 +1,84 @@
+-- pg_regress test: infer_goal (magic sets) with a recursive rule on a cyclic
+-- graph (v0147e).
+--
+-- Regression for: the magic-sets seed added the goal filter with AND when the
+-- compiled rule contained "WHERE " anywhere.  Every VP read expression has its
+-- own WHERE, so once the recursive SELECT lost its trailing WHERE NOT is_cycle
+-- the seed became "FROM derived_N AND s = ..." (syntax error).  The filter now
+-- wraps the rule's output rows.
+--
+-- Graph g: link is a ring of 40 nodes with edges i->i+1 and i->i+2 (strongly
+-- connected, so n0 reaches every node and every node reaches n5).  Expected
+-- answers come from a closure computed here without the extension.
+
+CREATE EXTENSION IF NOT EXISTS pg_ripple;
+SELECT pg_ripple.triple_count() >= 0 AS library_loaded;
+SET search_path TO pg_ripple, public;
+
+SELECT pg_ripple.drop_rules('goal_rs') >= 0 AS rules_reset;
+SELECT pg_ripple.drop_graph('https://goal.test/g') >= 0 AS graph_reset;
+
+CREATE TEMP TABLE goal_edge (s text, o text);
+INSERT INTO goal_edge
+SELECT 'n' || i, 'n' || ((i + d) % 40) FROM generate_series(0, 39) AS i, (VALUES (1), (2)) AS v(d);
+SELECT pg_ripple.load_nquads(string_agg(
+         format('<https://goal.test/%s> <https://goal.test/link> <https://goal.test/%s> <https://goal.test/g> .', s, o),
+         E'\n')) AS edges_loaded
+FROM goal_edge;
+
+-- Closure of link by path doubling.
+CREATE TEMP TABLE goal_closure (s text, o text, PRIMARY KEY (s, o));
+INSERT INTO goal_closure SELECT s, o FROM goal_edge;
+DO $$
+DECLARE
+    added bigint;
+BEGIN
+    LOOP
+        INSERT INTO goal_closure
+        SELECT DISTINCT a.s, b.o FROM goal_closure a JOIN goal_closure b ON b.s = a.o
+        ON CONFLICT DO NOTHING;
+        GET DIAGNOSTICS added = ROW_COUNT;
+        EXIT WHEN added = 0;
+    END LOOP;
+END $$;
+
+SELECT pg_ripple.load_rules(
+    'GRAPH ?g { ?x <https://goal.test/reach> ?y } :- GRAPH ?g { ?x <https://goal.test/link> ?y } .
+     GRAPH ?g { ?x <https://goal.test/reach> ?z } :-
+       GRAPH ?g { ?x <https://goal.test/link> ?y },
+       GRAPH ?g { ?y <https://goal.test/reach> ?z } .
+     GRAPH ?g { ?x <https://goal.test/near> ?y } :- GRAPH ?g { ?x <https://goal.test/link> ?y } .',
+    'goal_rs'
+) AS rules_loaded;
+
+SET pg_ripple.magic_sets = on;
+SET pg_ripple.rule_graph_scope = 'all';
+SET statement_timeout = '30s';
+SET temp_file_limit = '256MB';
+
+-- Subject bound on the recursive predicate.
+SELECT (pg_ripple.infer_goal('goal_rs', '<https://goal.test/n0> <https://goal.test/reach> ?z')->>'matching')::bigint
+           AS reach_from_n0,
+       (SELECT count(*) FROM goal_closure WHERE s = 'n0') AS expected;
+SELECT count(*) AS missing
+FROM (SELECT o FROM goal_closure WHERE s = 'n0'
+      EXCEPT
+      SELECT substring(t.r->>'z' FROM '^<https://goal[.]test/(.*)>$')
+      FROM pg_ripple.sparql('SELECT ?z WHERE { GRAPH <https://goal.test/g> { <https://goal.test/n0> <https://goal.test/reach> ?z } }') AS t(r)) x;
+
+-- Object bound on the recursive predicate.
+SELECT (pg_ripple.infer_goal('goal_rs', '?x <https://goal.test/reach> <https://goal.test/n5>')->>'matching')::bigint
+           AS reach_to_n5,
+       (SELECT count(*) FROM goal_closure WHERE o = 'n5') AS expected;
+
+-- Subject bound on a non-recursive predicate.
+SELECT (pg_ripple.infer_goal('goal_rs', '<https://goal.test/n0> <https://goal.test/near> ?y')->>'matching')::bigint
+           AS near_n0,
+       (SELECT count(*) FROM goal_edge WHERE s = 'n0') AS expected;
+
+RESET temp_file_limit;
+RESET statement_timeout;
+RESET pg_ripple.rule_graph_scope;
+RESET pg_ripple.magic_sets;
+SELECT pg_ripple.drop_rules('goal_rs') >= 0 AS rules_cleaned;
+SELECT pg_ripple.drop_graph('https://goal.test/g') >= 0 AS graph_cleaned;
