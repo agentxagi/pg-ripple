@@ -20,18 +20,30 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   minutes and wrote hundreds of GB of temporary files per hour. The same query
   without `CYCLE` returns the 22,693-fact closure in 73 ms. Recursive rules now
   compile to a plain set-semantics `UNION`, which discards rows already
-  derived and stops at the fixpoint; `WHERE NOT is_cycle` goes with it (a row
-  it filtered repeated a triple already derived, so the result is the same).
+  derived and stops at the fixpoint; `WHERE NOT is_cycle` goes with it. For
+  `GRAPH ?g` rules the result is the same (a row it filtered repeated a triple
+  already derived). For a rule without `GRAPH ?g` the result grows: the derived
+  triple takes the graph of the first edge of its path, and the old clause
+  compared only `(s, o)`, so with S→O in g1, S→Y in g2 and Y→S in g3 it dropped
+  S→O in g2 as a repeat of S→O in g1; it is derived now.
   The `datalog_max_depth` variant keeps its depth column, so the CTE holds at
   most `max_depth + 1` rows per triple, and inserts with `SELECT DISTINCT`;
   the on-demand CTE fragment (`compile_on_demand_cte`) drops `CYCLE` too.
+  `infer_goal` (magic sets) added the goal filter with `AND` whenever the
+  compiled rule contained `WHERE ` anywhere; every VP read expression has its
+  own `WHERE`, so without the trailing `WHERE NOT is_cycle` the seed of a
+  recursive goal became `FROM derived_N AND s = …` (syntax error). The filter
+  now wraps the rule's output rows (`SELECT s, o, g FROM (…) AS _goal (s, o, g)
+  WHERE …`), which also qualifies `s` and `o` for multi-atom bodies.
   Semi-naive (`infer_with_stats`) and plain (`infer`) inference, magic sets and
   WFS all reach this compiler. No SQL API change, the extension stays at
   0.141.0. Tests: `v0147d_datalog_closure_cyclic` (production-shaped rule set
   on rings with chords and strongly connected components in two graphs, under
-  `statement_timeout`; closure, `indirectly_runs_on` and the bounded variants
-  checked against sets computed without the extension; a second pass derives
-  nothing) and the pg_test
+  `statement_timeout`, through both `infer_with_stats` and `infer`; closure,
+  `indirectly_runs_on` and the bounded variants checked against sets computed
+  without the extension; a second pass adds exactly nothing; a rule without
+  `GRAPH ?g` across three graphs), `v0147e_datalog_goal_recursive`
+  (`infer_goal` on recursive and non-recursive predicates) and the pg_test
   `test_on_demand_cte_is_set_closure_on_cyclic_graph`.
 
 ## [0.141.0]

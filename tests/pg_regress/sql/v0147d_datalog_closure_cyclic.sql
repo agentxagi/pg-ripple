@@ -14,7 +14,9 @@
 --        cause: ring of 24 nodes, edges i->i+1 and i->i+2
 --   g/b  dep:   three rings of 20 nodes (edges +1 and +3), bridges n5->n27, n33->n41
 --   runs: s0->n0, s1->n17 in g/a; s0->n2, s2->n45, s3->n25 in g/b
+--   dep_p, cause_p, runs_p: copies read by the plain-path (infer) production rules
 --   link: a copy of dep, read by the plain-path and bounded-depth rule sets
+--   g/c1..c3  ng: S->O in c1, S->Y in c2, Y->S in c3, for a rule without GRAPH
 -- The expected sets are computed here from a plain edge table (path doubling
 -- and walk expansion), independently of the extension.  statement_timeout and
 -- temp_file_limit bound each inference: path enumeration fails them, the
@@ -25,9 +27,9 @@ SELECT pg_ripple.triple_count() >= 0 AS library_loaded;
 SET search_path TO pg_ripple, public;
 
 SELECT bool_and(pg_ripple.drop_rules(r) >= 0) AS rules_reset
-FROM unnest(ARRAY['cyc_prod', 'cyc_plain', 'cyc_depth3', 'cyc_depth30']) AS r;
-SELECT pg_ripple.drop_graph('https://cyc.test/g/a') >= 0 AS graph_a_reset;
-SELECT pg_ripple.drop_graph('https://cyc.test/g/b') >= 0 AS graph_b_reset;
+FROM unnest(ARRAY['cyc_prod', 'cyc_prodp', 'cyc_plain', 'cyc_depth3', 'cyc_depth30', 'cyc_ng']) AS r;
+SELECT bool_and(pg_ripple.drop_graph('https://cyc.test/g/' || g) >= 0) AS graphs_reset
+FROM unnest(ARRAY['a', 'b', 'c1', 'c2', 'c3']) AS g;
 
 -- ── Data ──────────────────────────────────────────────────────────────────────
 
@@ -46,8 +48,13 @@ FROM generate_series(0, 23) AS i, (VALUES (1), (2)) AS v(d)
 UNION ALL
 SELECT 'runs', s, o, g
 FROM (VALUES ('s0', 'n0', 'a'), ('s1', 'n17', 'a'),
-             ('s0', 'n2', 'b'), ('s2', 'n45', 'b'), ('s3', 'n25', 'b')) AS x(s, o, g);
-INSERT INTO cyc_edge SELECT 'link', s, o, g FROM cyc_edge WHERE p = 'dep';
+             ('s0', 'n2', 'b'), ('s2', 'n45', 'b'), ('s3', 'n25', 'b')) AS x(s, o, g)
+UNION ALL
+SELECT 'ng', s, o, g FROM (VALUES ('S', 'O', 'c1'), ('S', 'Y', 'c2'), ('Y', 'S', 'c3')) AS x(s, o, g);
+INSERT INTO cyc_edge
+SELECT p || '_p', s, o, g FROM cyc_edge WHERE p IN ('dep', 'cause', 'runs')
+UNION ALL
+SELECT 'link', s, o, g FROM cyc_edge WHERE p = 'dep';
 
 SELECT p, g, count(*) AS edges FROM cyc_edge GROUP BY p, g ORDER BY p, g;
 
@@ -59,9 +66,12 @@ FROM cyc_edge;
 
 -- ── Expected sets, computed without the extension ─────────────────────────────
 
--- Transitive closure of dep, cause and link by path doubling.
+-- Transitive closure by path doubling: per graph for dep, cause, dep_p, cause_p
+-- and link; over all graphs at once (g = '*') for ng.
 CREATE TEMP TABLE cyc_closure (p text, s text, o text, g text, PRIMARY KEY (p, s, o, g));
-INSERT INTO cyc_closure SELECT DISTINCT p, s, o, g FROM cyc_edge WHERE p IN ('dep', 'cause', 'link');
+INSERT INTO cyc_closure
+SELECT DISTINCT p, s, o, CASE WHEN p = 'ng' THEN '*' ELSE g END
+FROM cyc_edge WHERE p IN ('dep', 'cause', 'dep_p', 'cause_p', 'link', 'ng');
 DO $$
 DECLARE
     added bigint;
@@ -100,18 +110,36 @@ END $$;
 SELECT p, g, count(*) AS closure FROM cyc_closure GROUP BY p, g ORDER BY p, g;
 SELECT hops, g, count(*) AS pairs FROM cyc_within GROUP BY hops, g ORDER BY hops, g;
 
--- Contents of g/a and g/b after the production-shaped rule set.
+-- Expected contents of g/a and g/b, grown stage by stage: asserted edges first.
 CREATE TEMP TABLE cyc_expected AS
-SELECT p, s, o, g FROM cyc_closure WHERE p IN ('dep', 'cause')
-UNION
-SELECT 'indirect', r.s, c.o, r.g
-FROM cyc_edge r
-JOIN cyc_closure c ON c.p = 'dep' AND c.g = r.g AND c.s = r.o
-WHERE r.p = 'runs'
-UNION
-SELECT p, s, o, g FROM cyc_edge WHERE p IN ('runs', 'link');
+SELECT p, s, o, g FROM cyc_edge WHERE g IN ('a', 'b');
 
--- ── Production-shaped rule set (GRAPH ?g, semi-naive) ─────────────────────────
+-- Snapshot of g/a and g/b through SPARQL.  sparql() caches each translation
+-- per backend, and a cached variable-predicate query does not read a dedicated
+-- VP table created after it was cached, so the cache is reset first.
+CREATE TEMP TABLE cyc_got (p text, s text, o text, g text);
+CREATE FUNCTION pg_temp.cyc_snapshot() RETURNS bigint LANGUAGE sql AS $$
+    SELECT pg_ripple.plan_cache_reset();
+    DELETE FROM cyc_got;
+    INSERT INTO cyc_got
+    SELECT substring(t.r->>'p' FROM '^<https://cyc[.]test/(.*)>$'),
+           substring(t.r->>'s' FROM '^<https://cyc[.]test/(.*)>$'),
+           substring(t.r->>'o' FROM '^<https://cyc[.]test/(.*)>$'),
+           v.g
+    FROM (VALUES ('a'), ('b')) AS v(g),
+         LATERAL pg_ripple.sparql('SELECT ?s ?p ?o WHERE { GRAPH <https://cyc.test/g/' || v.g || '> { ?s ?p ?o } }') AS t(r);
+    SELECT count(*) FROM (SELECT DISTINCT * FROM cyc_got) x;
+$$;
+CREATE TEMP VIEW cyc_check AS
+SELECT (SELECT count(*) FROM (SELECT * FROM cyc_expected EXCEPT SELECT * FROM cyc_got) x) AS missing,
+       (SELECT count(*) FROM (SELECT * FROM cyc_got EXCEPT SELECT * FROM cyc_expected) x) AS unexpected,
+       (SELECT count(*) FROM cyc_got) - (SELECT count(*) FROM (SELECT DISTINCT * FROM cyc_got) x) AS duplicates;
+
+SET pg_ripple.rule_graph_scope = 'all';
+SET statement_timeout = '30s';
+SET temp_file_limit = '256MB';
+
+-- ── Production rule set, semi-naive (infer_with_stats) ────────────────────────
 
 SELECT pg_ripple.load_rules(
     'GRAPH ?g { ?x <https://cyc.test/dep> ?z } :-
@@ -132,47 +160,74 @@ SELECT count(*) AS rules,
        count(*) FILTER (WHERE r->>'sql' ~ 'CYCLE|is_cycle|cycle_path') AS with_cycle_clause
 FROM jsonb_array_elements(pg_ripple.explain_datalog('cyc_prod')->'sql_per_rule') AS r;
 
-SET pg_ripple.rule_graph_scope = 'all';
-SET statement_timeout = '30s';
-SET temp_file_limit = '256MB';
+INSERT INTO cyc_expected
+SELECT p, s, o, g FROM cyc_closure WHERE p IN ('dep', 'cause')
+UNION
+SELECT 'indirect', r.s, c.o, r.g
+FROM cyc_edge r
+JOIN cyc_closure c ON c.p = 'dep' AND c.g = r.g AND c.s = r.o
+WHERE r.p = 'runs'
+EXCEPT
+SELECT * FROM cyc_expected;
 
 -- First pass: everything in the closure that was not asserted is derived.
 SELECT (pg_ripple.infer_with_stats('cyc_prod')->>'derived')::bigint AS first_pass_derived,
-       (SELECT count(*) FROM cyc_expected) - (SELECT count(*) FROM cyc_edge) AS expected_derived;
+       (SELECT count(*) FROM cyc_expected) - (SELECT count(*) FROM cyc_edge WHERE g IN ('a', 'b'))
+           AS expected_derived;
+SELECT pg_temp.cyc_snapshot() AS triples_read;
+SELECT p, g, count(*) AS triples FROM cyc_got WHERE p IN ('dep', 'cause', 'indirect') GROUP BY p, g ORDER BY p, g;
+SELECT * FROM cyc_check;
 
-CREATE TEMP TABLE cyc_got AS
-SELECT substring(t.r->>'p' FROM '^<https://cyc[.]test/(.*)>$') AS p,
-       substring(t.r->>'s' FROM '^<https://cyc[.]test/(.*)>$') AS s,
-       substring(t.r->>'o' FROM '^<https://cyc[.]test/(.*)>$') AS o,
-       v.g
-FROM (VALUES ('a'), ('b')) AS v(g),
-     LATERAL pg_ripple.sparql('SELECT ?s ?p ?o WHERE { GRAPH <https://cyc.test/g/' || v.g || '> { ?s ?p ?o } }') AS t(r);
-
-SELECT p, g, count(*) AS triples FROM cyc_got GROUP BY p, g ORDER BY p, g;
-SELECT (SELECT count(*) FROM (SELECT * FROM cyc_expected EXCEPT SELECT * FROM cyc_got) x) AS missing,
-       (SELECT count(*) FROM (SELECT * FROM cyc_got EXCEPT SELECT * FROM cyc_expected) x) AS unexpected,
-       (SELECT count(*) FROM cyc_got) - (SELECT count(*) FROM (SELECT DISTINCT * FROM cyc_got) x) AS duplicates;
-
--- Second pass over the same data changes nothing.
+-- Second pass over the same data derives nothing.
 SELECT (pg_ripple.infer_with_stats('cyc_prod')->>'derived')::bigint AS second_pass_derived;
+SELECT pg_temp.cyc_snapshot() AS triples_read;
+SELECT * FROM cyc_check;
 
--- sparql() caches each translation per backend, and a cached variable-predicate
--- query does not read a dedicated VP table created after it was cached.
-SELECT pg_ripple.plan_cache_reset();
-TRUNCATE cyc_got;
-INSERT INTO cyc_got
-SELECT substring(t.r->>'p' FROM '^<https://cyc[.]test/(.*)>$'),
-       substring(t.r->>'s' FROM '^<https://cyc[.]test/(.*)>$'),
-       substring(t.r->>'o' FROM '^<https://cyc[.]test/(.*)>$'),
-       v.g
-FROM (VALUES ('a'), ('b')) AS v(g),
-     LATERAL pg_ripple.sparql('SELECT ?s ?p ?o WHERE { GRAPH <https://cyc.test/g/' || v.g || '> { ?s ?p ?o } }') AS t(r);
+-- ── The same production rules through the plain path (infer) ──────────────────
 
-SELECT (SELECT count(*) FROM (SELECT * FROM cyc_expected EXCEPT SELECT * FROM cyc_got) x) AS missing,
-       (SELECT count(*) FROM (SELECT * FROM cyc_got EXCEPT SELECT * FROM cyc_expected) x) AS unexpected,
-       (SELECT count(*) FROM cyc_got) - (SELECT count(*) FROM (SELECT DISTINCT * FROM cyc_got) x) AS duplicates;
+SELECT pg_ripple.load_rules(
+    'GRAPH ?g { ?x <https://cyc.test/dep_p> ?z } :-
+       GRAPH ?g { ?x <https://cyc.test/dep_p> ?y },
+       GRAPH ?g { ?y <https://cyc.test/dep_p> ?z } .
+     GRAPH ?g { ?s <https://cyc.test/indirect_p> ?i } :-
+       GRAPH ?g { ?s <https://cyc.test/runs_p> ?h },
+       GRAPH ?g { ?h <https://cyc.test/dep_p> ?i } .
+     GRAPH ?g { ?x <https://cyc.test/cause_p> ?z } :-
+       GRAPH ?g { ?x <https://cyc.test/cause_p> ?y },
+       GRAPH ?g { ?y <https://cyc.test/cause_p> ?z } .',
+    'cyc_prodp'
+) AS prodp_rules_loaded;
 
--- ── Plain path (infer) and bounded depth (datalog_max_depth) ──────────────────
+INSERT INTO cyc_expected
+SELECT p, s, o, g FROM cyc_closure WHERE p IN ('dep_p', 'cause_p')
+UNION
+SELECT 'indirect_p', r.s, c.o, r.g
+FROM cyc_edge r
+JOIN cyc_closure c ON c.p = 'dep_p' AND c.g = r.g AND c.s = r.o
+WHERE r.p = 'runs_p'
+EXCEPT
+SELECT * FROM cyc_expected;
+
+-- The plain path runs each rule once, and its strata put the non-recursive
+-- indirect_p rule (stratum 0) before the recursive dep_p rule: the first pass
+-- completes dep_p and cause_p, and indirect_p only joins the asserted dep_p
+-- edges (190 short).  The second pass completes it; the third adds nothing.
+-- Its inferred copies of asserted dep_p and cause_p rows also show twice in a
+-- variable-predicate scan (duplicates = 250).  Both predate this fix.
+SELECT pg_ripple.infer('cyc_prodp') >= 0 AS plain_first_pass;
+SELECT pg_temp.cyc_snapshot() - (SELECT count(*) FROM cyc_expected) AS short_of_expected;
+SELECT p, g, count(DISTINCT (s, o)) AS triples FROM cyc_got WHERE p LIKE '%\_p' GROUP BY p, g ORDER BY p, g;
+SELECT * FROM cyc_check;
+
+SELECT pg_ripple.infer('cyc_prodp') >= 0 AS plain_second_pass;
+SELECT pg_temp.cyc_snapshot() - (SELECT count(*) FROM cyc_expected) AS short_of_expected;
+SELECT * FROM cyc_check;
+
+-- Third plain pass: not one triple added.
+SELECT pg_ripple.infer('cyc_prodp') >= 0 AS plain_third_pass;
+SELECT pg_temp.cyc_snapshot() - (SELECT count(*) FROM cyc_expected) AS third_pass_added;
+
+-- ── Plain path on link (rules with a base atom) and bounded depth ─────────────
 
 SELECT pg_ripple.load_rules(
     'GRAPH ?g { ?x <https://cyc.test/reach> ?y } :- GRAPH ?g { ?x <https://cyc.test/link> ?y } .
@@ -207,9 +262,7 @@ SET pg_ripple.datalog_max_depth = 3;
 SELECT pg_ripple.infer('cyc_depth3') >= 0 AS depth3_inferred;
 SET pg_ripple.datalog_max_depth = 30;
 SELECT pg_ripple.infer('cyc_depth30') >= 0 AS depth30_inferred;
--- A second plain pass adds nothing.
 SET pg_ripple.datalog_max_depth = 0;
-SELECT pg_ripple.infer('cyc_plain') >= 0 AS plain_inferred_again;
 
 INSERT INTO cyc_expected
 SELECT 'reach', s, o, g FROM cyc_closure WHERE p = 'link'
@@ -218,22 +271,38 @@ SELECT 'reach3', s, o, g FROM cyc_within WHERE hops = 4
 UNION ALL
 SELECT 'reach30', s, o, g FROM cyc_within WHERE hops = 31;
 
--- sparql() caches each translation per backend, and a cached variable-predicate
--- query does not read a dedicated VP table created after it was cached.
-SELECT pg_ripple.plan_cache_reset();
-TRUNCATE cyc_got;
-INSERT INTO cyc_got
-SELECT substring(t.r->>'p' FROM '^<https://cyc[.]test/(.*)>$'),
-       substring(t.r->>'s' FROM '^<https://cyc[.]test/(.*)>$'),
-       substring(t.r->>'o' FROM '^<https://cyc[.]test/(.*)>$'),
-       v.g
-FROM (VALUES ('a'), ('b')) AS v(g),
-     LATERAL pg_ripple.sparql('SELECT ?s ?p ?o WHERE { GRAPH <https://cyc.test/g/' || v.g || '> { ?s ?p ?o } }') AS t(r);
+SELECT pg_temp.cyc_snapshot() AS triples_read;
+SELECT p, g, count(DISTINCT (s, o)) AS triples FROM cyc_got WHERE p LIKE 'reach%' GROUP BY p, g ORDER BY p, g;
+SELECT * FROM cyc_check;
 
-SELECT p, g, count(*) AS triples FROM cyc_got WHERE p LIKE 'reach%' GROUP BY p, g ORDER BY p, g;
-SELECT (SELECT count(*) FROM (SELECT * FROM cyc_expected EXCEPT SELECT * FROM cyc_got) x) AS missing,
-       (SELECT count(*) FROM (SELECT * FROM cyc_got EXCEPT SELECT * FROM cyc_expected) x) AS unexpected,
-       (SELECT count(*) FROM cyc_got) - (SELECT count(*) FROM (SELECT DISTINCT * FROM cyc_got) x) AS duplicates;
+-- A second plain pass adds nothing.
+SELECT pg_ripple.infer('cyc_plain') >= 0 AS plain_inferred_again;
+SELECT pg_temp.cyc_snapshot() - (SELECT count(*) FROM cyc_expected) AS second_pass_added;
+
+-- ── Rule without GRAPH: rows differ by graph, not only by (s, o) ──────────────
+-- The derived triple takes the graph of the first edge of its path.  S->Y (c2),
+-- Y->S (c3), S->O (c1) derive S->O in c2: the old CYCLE clause, which compared
+-- only (s, o), dropped it as a repeat of S->O (c1).
+
+SELECT pg_ripple.load_rules(
+    '?x <https://cyc.test/ng> ?z :- ?x <https://cyc.test/ng> ?y , ?y <https://cyc.test/ng> ?z .',
+    'cyc_ng'
+) AS ng_rules_loaded;
+SELECT pg_ripple.infer('cyc_ng') >= 0 AS ng_inferred;
+
+CREATE TEMP TABLE cyc_ng_expected AS
+SELECT s, o, g FROM cyc_edge WHERE p = 'ng'
+UNION
+SELECT e.s, c.o, e.g FROM cyc_edge e JOIN cyc_closure c ON c.p = 'ng' AND c.s = e.o WHERE e.p = 'ng';
+CREATE TEMP TABLE cyc_ng_got AS
+SELECT substring(t.r->>'s' FROM '^<https://cyc[.]test/(.*)>$') AS s,
+       substring(t.r->>'o' FROM '^<https://cyc[.]test/(.*)>$') AS o,
+       substring(t.r->>'g' FROM '^<https://cyc[.]test/g/(.*)>$') AS g
+FROM pg_ripple.sparql('SELECT ?g ?s ?o WHERE { GRAPH ?g { ?s <https://cyc.test/ng> ?o } }') AS t(r);
+
+SELECT s, o, g FROM cyc_ng_got ORDER BY g, s, o;
+SELECT (SELECT count(*) FROM (SELECT * FROM cyc_ng_expected EXCEPT SELECT * FROM cyc_ng_got) x) AS missing,
+       (SELECT count(*) FROM (SELECT * FROM cyc_ng_got EXCEPT SELECT * FROM cyc_ng_expected) x) AS unexpected;
 
 -- ── Cleanup ───────────────────────────────────────────────────────────────────
 
@@ -242,6 +311,6 @@ RESET statement_timeout;
 RESET pg_ripple.datalog_max_depth;
 RESET pg_ripple.rule_graph_scope;
 SELECT bool_and(pg_ripple.drop_rules(r) >= 0) AS rules_cleaned
-FROM unnest(ARRAY['cyc_prod', 'cyc_plain', 'cyc_depth3', 'cyc_depth30']) AS r;
-SELECT pg_ripple.drop_graph('https://cyc.test/g/a') >= 0 AS graph_a_cleaned;
-SELECT pg_ripple.drop_graph('https://cyc.test/g/b') >= 0 AS graph_b_cleaned;
+FROM unnest(ARRAY['cyc_prod', 'cyc_prodp', 'cyc_plain', 'cyc_depth3', 'cyc_depth30', 'cyc_ng']) AS r;
+SELECT bool_and(pg_ripple.drop_graph('https://cyc.test/g/' || g) >= 0) AS graphs_cleaned
+FROM unnest(ARRAY['a', 'b', 'c1', 'c2', 'c3']) AS g;
