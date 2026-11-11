@@ -6,6 +6,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ---
+## [Unreleased]
+
+### Fixed
+
+- **A recursive Datalog rule over a graph with cycles enumerated paths and
+  never finished.** `compile_recursive_rule` emitted `WITH RECURSIVE … UNION …
+  CYCLE s, o, g SET is_cycle USING cycle_path`. `CYCLE` adds the path to every
+  row of the CTE, so `UNION` kept one row per distinct path and the recursion
+  enumerated every simple path of the graph instead of computing the closure.
+  In ValorBrain, the transitive `depends_on` rule (`GRAPH ?g`, 19,691 facts,
+  cycles) did not finish: cancelled after 37 s, while the real pass ran for
+  minutes and wrote hundreds of GB of temporary files per hour. The same query
+  without `CYCLE` returns the 22,693-fact closure in 73 ms. Recursive rules now
+  compile to a plain set-semantics `UNION`, which discards rows already
+  derived and stops at the fixpoint; `WHERE NOT is_cycle` goes with it (a row
+  it filtered repeated a triple already derived, so the result is the same).
+  The `datalog_max_depth` variant keeps its depth column, so the CTE holds at
+  most `max_depth + 1` rows per triple, and inserts with `SELECT DISTINCT`;
+  the on-demand CTE fragment (`compile_on_demand_cte`) drops `CYCLE` too.
+  Semi-naive (`infer_with_stats`) and plain (`infer`) inference, magic sets and
+  WFS all reach this compiler. No SQL API change, the extension stays at
+  0.141.0. Tests: `v0147d_datalog_closure_cyclic` (production-shaped rule set
+  on rings with chords and strongly connected components in two graphs, under
+  `statement_timeout`; closure, `indirectly_runs_on` and the bounded variants
+  checked against sets computed without the extension; a second pass derives
+  nothing) and the pg_test
+  `test_on_demand_cte_is_set_closure_on_cyclic_graph`.
+
 ## [0.141.0]
 
 Cross-graph justification: the graph-scoped `justify(s, p, o, g)` resolves

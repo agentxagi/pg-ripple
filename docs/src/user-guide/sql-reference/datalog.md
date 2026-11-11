@@ -135,7 +135,7 @@ SELECT pg_ripple.infer('rdfs');
 -- Returns: 42 (the number of new derived triples)
 ```
 
-Non-recursive strata use `INSERT … SELECT … ON CONFLICT DO NOTHING`. Recursive strata use `WITH RECURSIVE … CYCLE` (PostgreSQL 18 native cycle detection).
+Non-recursive strata use `INSERT … SELECT … ON CONFLICT DO NOTHING`. Recursive strata use `WITH RECURSIVE … UNION`: set semantics discard rows already derived, so the recursion stops at the fixpoint on cyclic graphs too. There is no `CYCLE` clause, which would keep one row per path and enumerate every path of the graph.
 
 ---
 

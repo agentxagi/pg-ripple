@@ -3,7 +3,7 @@
 //! Each Datalog rule is compiled to one or more SQL statements:
 //!
 //! - **Non-recursive rules** → `INSERT … SELECT … ON CONFLICT DO NOTHING`
-//! - **Recursive rules**     → `WITH RECURSIVE … CYCLE … INSERT … SELECT`
+//! - **Recursive rules**     → `WITH RECURSIVE … UNION … INSERT … SELECT` (set semantics, no CYCLE)
 //! - **Negation** → `NOT EXISTS (…)` in the WHERE clause (small tables) or
 //!   `LEFT JOIN … IS NULL` anti-join form (large tables, v0.29.0)
 //! - **Constraint rules**    → `SELECT EXISTS (…) AS violated`

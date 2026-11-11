@@ -14,7 +14,7 @@
 //!     ▼
 //! Per-stratum SQL generator (compiler.rs):
 //!   - Non-recursive rules → INSERT … SELECT … ON CONFLICT DO NOTHING
-//!   - Recursive rules     → WITH RECURSIVE … CYCLE
+//!   - Recursive rules     → WITH RECURSIVE … UNION (set semantics, no CYCLE)
 //!   - Negation            → NOT EXISTS (higher strata only)
 //!     │
 //!     ▼
