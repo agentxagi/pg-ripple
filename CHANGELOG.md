@@ -87,6 +87,39 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   a fresh connection, the cached SELECT before and after a late load, and a
   read-only role asking for stored and unknown literals).
 
+- **Every merge cycle rewrote `subject_patterns` and `object_patterns`.**
+  `rebuild_subject_patterns`/`rebuild_object_patterns` upserted every subject and
+  object with `DO UPDATE SET pattern = EXCLUDED.pattern`, also when the pattern
+  was the same: in production 159 k and 266 k rows per cycle, 47 MB and 95 MB of
+  WAL, 4.1 GB in 1 h 45 (66 % of the day's WAL). Only subjects and objects whose
+  pattern is new or changed now reach the upsert (anti-join against the current
+  table); `ON CONFLICT DO UPDATE … WHERE` alone still locked every conflicting row
+  and wrote a lock record per row (10.1 MB of WAL per rebuild of a test set on
+  main, 1.18 MB with the `WHERE` only, 40 bytes with the anti-join). Test:
+  `v0147g_pattern_rebuild_no_rewrite` (a second rebuild neither rewrites nor locks
+  a row: the main branch rewrote all 37).
+
+- **Background workers never reported table statistics.** A background worker
+  has to call `pgstat_report_stat` itself (PostgreSQL 18's `worker_spi` does it
+  after each commit), so `pg_stat_user_tables` showed `n_tup_upd = 0` and
+  `n_dead_tup = 0` after the merge worker rewrote 10.4 million rows, autovacuum
+  never ran, and the two pattern tables grew to 3.1 GB and 6.2 GB for ~40 MB of
+  live data. The merge worker and the logical apply worker now report after each
+  cycle, outside the transaction. Manual probe on a disposable PostgreSQL 18.6
+  with the worker running: `vp_N_main` inserts, `vp_N_delta` deletes and the
+  pattern upserts show up in `pg_stat_user_tables` (all 0 before).
+
+- **SIGHUP was logged as "configuration reloaded" but reloaded nothing.**
+  pgrx's handler only sets `ConfigReloadPending` and the latch; the extension
+  never called `ProcessConfigFile`, so `ALTER SYSTEM … ; pg_reload_conf()` did
+  not reach the workers (production: `merge_threshold` 10 000 → 100 000 and the
+  next merge cycle still used 10 000). The merge, logical apply and CDC cleanup
+  workers now clear the flag and call `ProcessConfigFile(PGC_SIGHUP)` outside a
+  transaction, as PostgreSQL 18's `worker_spi` does; the merge worker also
+  re-reads `merge_interval_secs`. Manual probe (worker running,
+  `merge_threshold = 10` in the file, then `ALTER SYSTEM … = 1000000` and
+  reload, 50 inserts): main merged the delta within 10 s, the fix did not.
+
 ## [0.141.0]
 
 Cross-graph justification: the graph-scoped `justify(s, p, o, g)` resolves
