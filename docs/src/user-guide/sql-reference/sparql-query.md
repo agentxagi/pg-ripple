@@ -167,7 +167,7 @@ SELECT ?target WHERE { <ex:alice> (<ex:knows>|<ex:follows>) ?target }
 SELECT ?who WHERE { ?who ^<ex:knows> <ex:bob> }
 ```
 
-Property paths compile to PostgreSQL `WITH RECURSIVE` CTEs with the PG18 `CYCLE` clause for hash-based cycle detection. See [max_path_depth](../../operations/configuration.md#max_path_depth) to limit traversal depth.
+Property paths compile to PostgreSQL `WITH RECURSIVE` CTEs with a set-semantics `UNION`, which stops at the closure on cyclic graphs. See [max_path_depth](../../operations/configuration.md#max_path_depth) to limit traversal depth.
 
 ### Named graphs
 

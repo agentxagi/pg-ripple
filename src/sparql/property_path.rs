@@ -736,19 +736,29 @@ fn compile_conf_path(
         .map(|of| format!("AND _cp{n}.o = {of}"))
         .unwrap_or_default();
 
-    // Confidence filter: edges without a row are treated as confidence = 1.0.
-    let conf_cond = format!(
-        "COALESCE((\
-           SELECT MAX(c.confidence) FROM _pg_ripple.confidence c \
-           WHERE c.statement_id = edge.\"_sid\"\
-         ), 1.0) >= {min_conf}"
-    );
-    let conf_cond2 = format!(
-        "COALESCE((\
-           SELECT MAX(c.confidence) FROM _pg_ripple.confidence c \
-           WHERE c.statement_id = edge2.\"_sid\"\
-         ), 1.0) >= {min_conf}"
-    );
+    // Confidence filter: edges without a row are treated as confidence = 1.0.  A
+    // fresh install has no `_pg_ripple.confidence` until confidence is first loaded
+    // (`ensure_confidence_catalog`, which then advances the schema generation, so a
+    // translation cached before the table existed is not reused).
+    let has_conf_table =
+        pgrx::Spi::get_one::<bool>("SELECT to_regclass('_pg_ripple.confidence') IS NOT NULL")
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+    let conf_of = |alias: &str| {
+        if has_conf_table {
+            format!(
+                "COALESCE((\
+                   SELECT MAX(c.confidence) FROM _pg_ripple.confidence c \
+                   WHERE c.statement_id = {alias}.\"_sid\"\
+                 ), 1.0) >= {min_conf}"
+            )
+        } else {
+            format!("1.0 >= {min_conf}")
+        }
+    };
+    let conf_cond = conf_of("edge");
+    let conf_cond2 = conf_of("edge2");
 
     format!(
         "(WITH RECURSIVE _cp{n}(s, o{g_col}, _depth) AS (\

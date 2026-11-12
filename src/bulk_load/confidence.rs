@@ -10,6 +10,14 @@ use crate::dictionary;
 /// migration script has been applied), `CREATE TABLE IF NOT EXISTS` creates the
 /// table on-demand; on upgraded instances it is a no-op.
 pub fn ensure_confidence_catalog() {
+    // pg:confPath translations made while the table was missing treat every edge
+    // as confidence 1.0: creating it advances the schema generation (part of the
+    // plan cache key) so they are not reused.
+    let existed =
+        pgrx::Spi::get_one::<bool>("SELECT to_regclass('_pg_ripple.confidence') IS NOT NULL")
+            .ok()
+            .flatten()
+            .unwrap_or(true);
     pgrx::Spi::run(
         "CREATE TABLE IF NOT EXISTS _pg_ripple.confidence ( \
             statement_id BIGINT  NOT NULL, \
@@ -26,6 +34,9 @@ pub fn ensure_confidence_catalog() {
          ON _pg_ripple.confidence (statement_id)",
     )
     .unwrap_or_else(|e| pgrx::warning!("confidence_stmt_idx creation: {e}"));
+    if !existed {
+        crate::storage::bump_schema_generation();
+    }
 }
 
 /// Load triples with an explicit uniform confidence score.

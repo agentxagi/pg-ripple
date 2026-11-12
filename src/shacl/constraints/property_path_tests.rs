@@ -34,7 +34,10 @@ mod tests {
         let n0 = crate::dictionary::lookup_iri("https://shp.test/n0").unwrap();
         let dep = || Box::new(ShPath::Predicate("https://shp.test/dep".to_owned()));
 
-        Spi::run("SET LOCAL statement_timeout = '10s'").unwrap();
+        // The pg_test already runs inside one statement: a statement_timeout set
+        // here would not apply to it, a temp_file_limit does (path enumeration
+        // spills to temp files).
+        Spi::run("SET LOCAL temp_file_limit = '256MB'").unwrap();
         for path in [ShPath::OneOrMore(dep()), ShPath::ZeroOrMore(dep())] {
             let reached = traverse_sh_path(&path, n0, 0);
             let mut distinct = reached.clone();

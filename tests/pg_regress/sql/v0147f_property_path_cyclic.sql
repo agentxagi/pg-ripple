@@ -88,6 +88,13 @@ SELECT count(*) AS conf_graph_var,
 FROM pg_ripple.sparql('SELECT ?g ?o WHERE { GRAPH ?g { <https://pp.test/n0> (<http://pg-ripple.org/conf_path/https://pp.test/dep/0.5>|<https://pp.test/none>) ?o } }');
 SELECT count(*) AS conf_dag_from_a, count(DISTINCT r->>'o') AS distinct_objects
 FROM pg_ripple.sparql('SELECT ?o WHERE { GRAPH <https://pp.test/g> { <https://pp.test/a> (<http://pg-ripple.org/conf_path/https://pp.test/dag/0.5>|<https://pp.test/none>) ?o } }') AS t(r);
+-- p -> q -> r with p -> r: three pairs; one row per path gave four.
+SELECT pg_ripple.load_nquads(
+    '<https://pp.test/p> <https://pp.test/tri> <https://pp.test/q> <https://pp.test/g> .
+     <https://pp.test/q> <https://pp.test/tri> <https://pp.test/r> <https://pp.test/g> .
+     <https://pp.test/p> <https://pp.test/tri> <https://pp.test/r> <https://pp.test/g> .') AS tri_loaded;
+SELECT count(*) AS conf_tri_pairs, count(DISTINCT (r->>'s', r->>'o')) AS distinct_pairs
+FROM pg_ripple.sparql('SELECT ?s ?o WHERE { GRAPH <https://pp.test/g> { ?s (<http://pg-ripple.org/conf_path/https://pp.test/tri/0.5>|<https://pp.test/none>) ?o } }') AS t(r);
 RESET temp_file_limit;
 RESET statement_timeout;
 SELECT pg_ripple.drop_graph('https://pp.test/g') >= 0 AS graph_cleaned;

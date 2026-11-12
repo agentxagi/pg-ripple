@@ -19,7 +19,15 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   each edge by its confidence, so the result is the same closure over the kept
   edges) and gets the same fix, plus `DISTINCT` (a DAG returned an object once per
   path), the anchor alias of a bound subject ("missing FROM-clause entry for table
-  edge_anchor") and the graph column for `GRAPH ?g`. SHACL `sh:oneOrMorePath`/`sh:zeroOrMorePath` had the
+  edge_anchor") and the graph column for `GRAPH ?g`; without
+  `_pg_ripple.confidence` (a fresh install, until confidence is first loaded) it
+  treats every edge as 1.0 instead of failing, and creating the table advances
+  the schema generation. Known limitation, documented: the `conf_path` IRI only
+  works inside a property path expression, not as the predicate of a plain triple
+  pattern. Cost of the depth limit, documented: with `max_path_depth > 0` a pair
+  is kept once per walk length, so on a symmetric tree an unanchored `p+` can
+  produce tens of times more rows than with `0` (511-node binary tree: 11.7 M CTE
+  rows and 20.5 s at 100, 261 k rows and 2.0 s at 0). SHACL `sh:oneOrMorePath`/`sh:zeroOrMorePath` had the
   same SQL (no caller reaches it yet) and get the same fix; SKOS ancestors and
   descendants already used `UNION` with a depth cap of 50 (only a comment said
   `CYCLE`). Tests: `v0147f_property_path_cyclic`, pg_test
