@@ -87,3 +87,36 @@ CREATE TABLE IF NOT EXISTS _pg_ripple.cdc_lsn_watermark (
 ```
 
 **Conserto provável:** criar a tabela no SQL de instalação (`extension_sql!`) e também numa migração idempotente, para quem instalou direto numa versão que não tem a tabela.
+
+## 5. Tombstone de predicado que só teve delete nunca é aplicado; `drop_graph` repetido dobra tombstones
+
+Visto ao escrever o `v0147h` (#37).
+
+- `merge_all` (`src/storage/merge.rs:802`) só faz merge de predicado com linha no delta. Um predicado que só recebeu deletes fica com os tombstones e com as linhas mortas no main até a próxima inserção; a view continua na forma com `LEFT JOIN` nos tombstones.
+- Um segundo `drop_graph` do mesmo grafo grava tombstone de novo para as linhas já marcadas: no teste, 930 tombstones para 465 linhas.
+
+**Reprodução:** carregar triplas num grafo, rodar `compact()`, depois `drop_graph` duas vezes e `compact()`. O main continua com as linhas, `vp_{id}_tombstones` fica com o dobro e o `compact()` não as aplica.
+
+## 6. `construct_rules/retract.rs:77` grava tombstone sem reconstruir a view
+
+Achado na revisão do #37. Não foi reproduzido.
+
+O caminho de retração do CONSTRUCT grava em `vp_{id}_tombstones` sem chamar `rebuild_htap_view`. Se o predicado estava sem tombstones, a view fica na forma sem o `LEFT JOIN` e continua devolvendo a linha apagada. Isso quebra a premissa do anti-join do #37 quando o mesmo predicado é alvo de CONSTRUCT e cabeça de regra Datalog: a passada pula uma linha que deveria rederivar.
+
+## 7. `er_monitoring_prune` usa `.ok()`, mas o erro do PostgreSQL vira panic
+
+Achado na revisão do #36 (P1). A produção tem as tabelas e não é afetada.
+
+Em `src/er_monitoring.rs:139-165`: sem a tabela `_pg_ripple.er_unresolved_entities`, que só `enable_er_monitoring()` cria, o ciclo do trabalhador 0 termina em panic logo depois do merge, em todo ciclo, e o trabalhador fica em backoff permanente. O `.ok()` em volta da chamada não pega o ERROR do PostgreSQL.
+
+## 8. `build.rs` só recalcula o `GIT_SHA` quando o `.versions.toml` muda
+
+Achado na revisão do #36 (P4).
+
+Num build incremental, a linha `loaded (release build, … git <sha>)` do log e o `build_info()` podem trazer o commit de um build anterior (a revisão viu "git 725d62c2" num build da main). O kit da janela contorna com `cargo clean -p pg_ripple --release` e `GIT_SHA=<8>` exportado, e confere o `build_info()`. Conserto provável: `cargo::rerun-if-changed` para `.git/HEAD` e para a ref atual, ou `rerun-if-env-changed=GIT_SHA`.
+
+## 9. O `v0147d` não roda duas vezes no mesmo banco
+
+Achado na revisão do #37.
+
+Na suíte, cada teste roda uma vez num banco novo, então nada quebra hoje. Mas, ao contrário do `v0147g` e do `v0147h`, o `v0147d` não passa numa segunda rodada no mesmo banco, o que atrapalha quem repete o teste para medir. A causa não foi investigada.

@@ -106,8 +106,6 @@ pub(super) fn vp_read_expr(pred_id: i64) -> String {
     }
 }
 
-/// Does `pred_id` have a dedicated HTAP VP table (`predicates.table_oid`)?
-/// Single SPI probe shared by every read-expression builder.
 /// Wrap the SELECT of a plain-path insert (`mark_inferred`, target: the head's
 /// HTAP delta) so it skips the rows the head's view already returns.  The delta's
 /// `ON CONFLICT` only sees the delta, so every pass after a merge copied the
@@ -127,6 +125,8 @@ pub(super) fn skip_visible(select_sql: String, head_pred: i64, mark_inferred: bo
     )
 }
 
+/// Does `pred_id` have a dedicated HTAP VP table (`predicates.table_oid`)?
+/// Single SPI probe shared by every read-expression builder.
 pub(crate) fn has_dedicated_vp(pred_id: i64) -> bool {
     pgrx::Spi::get_one_with_args::<i64>(
         "SELECT table_oid::bigint FROM _pg_ripple.predicates \
