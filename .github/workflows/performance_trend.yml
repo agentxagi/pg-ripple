@@ -67,7 +67,7 @@ jobs:
         run: cargo pgrx init --pg18 download
 
       - name: Build extension
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Start pgrx PostgreSQL 18
         run: cargo pgrx start pg18

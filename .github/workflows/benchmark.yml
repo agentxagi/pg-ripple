@@ -73,7 +73,7 @@ jobs:
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
 
       - name: Build extension
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config --release
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)" --release
 
       - name: Create extension in database
         run: |
