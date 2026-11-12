@@ -250,7 +250,7 @@ jobs:
         run: cargo pgrx start pg18
 
       - name: Install extension into live instance
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config --release 2>/dev/null || cargo pgrx install --pg-config $(find ~/.pgrx -name pg_config | head -1) 2>/dev/null || echo "Install skipped — pg_config path not found"
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)" --release 2>/dev/null || cargo pgrx install --pg-config $(find ~/.pgrx -name pg_config | head -1) 2>/dev/null || echo "Install skipped — pg_config path not found"
 
       - name: Validate examples (live, L15-03)
         run: |
@@ -418,7 +418,7 @@ jobs:
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
 
       - name: Install pg_ripple
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Run W3C smoke subset
         env:
@@ -509,7 +509,7 @@ jobs:
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
 
       - name: Install pg_ripple
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Run W3C full suite (8 threads)
         env:
@@ -609,7 +609,7 @@ jobs:
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
 
       - name: Install pg_ripple
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Run Jena conformance suite (1 thread)
         env:
@@ -706,7 +706,7 @@ jobs:
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
 
       - name: Install pg_ripple
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Run WatDiv benchmark suite (8 threads)
         env:
@@ -788,7 +788,7 @@ jobs:
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
 
       - name: Install pg_ripple
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Run LUBM conformance suite
         env:
@@ -941,7 +941,7 @@ jobs:
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
 
       - name: Install pg_ripple
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Run OWL 2 RL conformance suite
         env:
@@ -1010,7 +1010,7 @@ jobs:
         run: cargo pgrx init --pg18 download
 
       - name: Build and install pg_ripple for PG18
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Start pgrx PostgreSQL 18
         run: cargo pgrx start pg18
@@ -1090,7 +1090,7 @@ jobs:
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
 
       - name: Install pg_ripple
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Run Datalog convergence suite
         env:
@@ -1239,7 +1239,7 @@ jobs:
         run: cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
 
       - name: Install pg_ripple
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Run BSBM regression check
         env:
@@ -1512,7 +1512,7 @@ jobs:
       - name: Build and install extension
         run: |
           cargo pgrx init --pg18 download
-          PG_CONFIG="$(echo "$HOME"/.pgrx/18.*/pgrx-install/bin/pg_config)"
+          PG_CONFIG="$(ls -d "$HOME"/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
           cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
           cargo pgrx install --pg-config "$PG_CONFIG"
 
@@ -1601,7 +1601,7 @@ jobs:
       - name: Build and install extension
         run: |
           cargo pgrx init --pg18 download
-          PG_CONFIG="$(echo "$HOME"/.pgrx/18.*/pgrx-install/bin/pg_config)"
+          PG_CONFIG="$(ls -d "$HOME"/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
           cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
           cargo pgrx install --pg-config "$PG_CONFIG"
 
@@ -1710,7 +1710,7 @@ jobs:
       - name: Build and install extension
         run: |
           cargo pgrx init --pg18 download
-          PG_CONFIG="$(echo "$HOME"/.pgrx/18.*/pgrx-install/bin/pg_config)"
+          PG_CONFIG="$(ls -d "$HOME"/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
           cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
           cargo pgrx install --pg-config "$PG_CONFIG"
 
@@ -1786,7 +1786,7 @@ jobs:
       - name: Build and install extension
         run: |
           cargo pgrx init --pg18 download
-          PG_CONFIG="$(echo "$HOME"/.pgrx/18.*/pgrx-install/bin/pg_config)"
+          PG_CONFIG="$(ls -d "$HOME"/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
           cargo pgrx start pg18 --postgresql-conf "allow_system_table_mods=on"
           cargo pgrx install --pg-config "$PG_CONFIG"
 
