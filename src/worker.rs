@@ -378,6 +378,9 @@ pub extern "C-unwind" fn pg_ripple_merge_worker_main(arg: pg_sys::Datum) {
                  backing off for {backoff_secs}s (max {max_backoff}s)"
             );
 
+            // The failed cycle's transaction is aborted above: report what it wrote.
+            report_table_stats();
+
             // v0.51.0: use wait_latch for correct SIGTERM response during backoff (S1-3).
             // If SIGTERM is received, wait_latch returns false and the outer while loop exits.
             if !BackgroundWorker::wait_latch(Some(Duration::from_secs(backoff_secs))) {
@@ -388,6 +391,7 @@ pub extern "C-unwind" fn pg_ripple_merge_worker_main(arg: pg_sys::Datum) {
 
         // Merge succeeded — reset error counter.
         consecutive_errors = 0;
+        report_table_stats();
     }
 
     // Worker is terminating.  Only worker 0 clears the shared PID.
@@ -879,4 +883,22 @@ fn get_merge_interval() -> u64 {
 
 fn get_merge_threshold() -> i64 {
     crate::MERGE_THRESHOLD.get() as i64
+}
+
+/// Flush this worker's pending table statistics to the shared statistics.
+///
+/// A client backend does this when it goes idle; a background worker has to do
+/// it itself.  Without it `pg_stat_user_tables` never sees what the merge worker
+/// writes (measured in production: 10.4 million rows rewritten in
+/// `subject_patterns`/`object_patterns` with `n_tup_upd = 0`), so autovacuum never
+/// visits those tables and they only grow.  PostgreSQL 18's own example
+/// (`src/test/modules/worker_spi/worker_spi.c`) calls `pgstat_report_stat(true)`
+/// right after `CommitTransactionCommand()`; it must run outside a transaction
+/// (`pgstat.c` asserts `!IsTransactionOrTransactionBlock()`).
+pub(crate) fn report_table_stats() {
+    // SAFETY: called by a background worker connected to a database, between
+    // transactions; it only flushes this process's pending statistics entries.
+    unsafe {
+        pg_sys::pgstat_report_stat(true);
+    }
 }

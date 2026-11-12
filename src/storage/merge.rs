@@ -833,6 +833,10 @@ pub fn merge_all() -> i64 {
 ///
 /// For each subject, records the sorted array of all predicates it appears in.
 /// Called by the merge worker after each generation merge.
+/// Every merge cycle calls both rebuilds over all subjects and objects; a row whose
+/// pattern did not change is left alone (`WHERE … IS DISTINCT FROM`), so a cycle
+/// writes only the patterns that changed instead of rewriting the whole table
+/// (47 MB and 95 MB of WAL per cycle in production before this).
 pub fn rebuild_subject_patterns() {
     // Collect all HTAP predicate IDs (predicates with dedicated VP tables).
     // Predicate with table_oid IS NOT NULL are those promoted from vp_rare to have
@@ -873,7 +877,8 @@ pub fn rebuild_subject_patterns() {
              FROM ({union_sql}) AS all_triples \
              GROUP BY s \
              ON CONFLICT (s) DO UPDATE \
-                 SET pattern = EXCLUDED.pattern"
+                 SET pattern = EXCLUDED.pattern \
+                 WHERE _pg_ripple.subject_patterns.pattern IS DISTINCT FROM EXCLUDED.pattern"
         ),
         &[],
     )
@@ -917,7 +922,8 @@ pub fn rebuild_object_patterns() {
              FROM ({union_sql}) AS all_triples \
              GROUP BY o \
              ON CONFLICT (o) DO UPDATE \
-                 SET pattern = EXCLUDED.pattern"
+                 SET pattern = EXCLUDED.pattern \
+                 WHERE _pg_ripple.object_patterns.pattern IS DISTINCT FROM EXCLUDED.pattern"
         ),
         &[],
     )
