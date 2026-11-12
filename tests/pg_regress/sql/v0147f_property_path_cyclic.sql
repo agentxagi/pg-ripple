@@ -67,6 +67,27 @@ SELECT count(*) AS plus_one_hop,
 FROM pg_ripple.sparql('SELECT ?o WHERE { GRAPH <https://pp.test/g> { <https://pp.test/n0> <https://pp.test/dep>+ ?o } }');
 
 RESET pg_ripple.max_path_depth;
+
+-- pg:confPath filters each edge by its confidence (none stored here: 1.0), so it
+-- is the same closure.  It used UNION ALL with CYCLE too; with a bound subject it
+-- failed with "missing FROM-clause entry for table edge_anchor", and on a DAG it
+-- returned an object once per path.  The alternative forces the path compiler.
+SELECT pg_ripple.load_nquads(
+    '<https://pp.test/a> <https://pp.test/dag> <https://pp.test/b> <https://pp.test/g> .
+     <https://pp.test/a> <https://pp.test/dag> <https://pp.test/c> <https://pp.test/g> .
+     <https://pp.test/b> <https://pp.test/dag> <https://pp.test/d> <https://pp.test/g> .
+     <https://pp.test/c> <https://pp.test/dag> <https://pp.test/d> <https://pp.test/g> .') AS dag_loaded;
+SELECT count(*) AS conf_from_n0,
+       (SELECT count(*) FROM pp_closure WHERE s = 'n0') AS expected
+FROM pg_ripple.sparql('SELECT ?o WHERE { GRAPH <https://pp.test/g> { <https://pp.test/n0> (<http://pg-ripple.org/conf_path/https://pp.test/dep/0.5>|<https://pp.test/none>) ?o } }');
+SELECT count(*) AS conf_all_pairs,
+       (SELECT count(*) FROM pp_closure) AS expected
+FROM pg_ripple.sparql('SELECT ?s ?o WHERE { GRAPH <https://pp.test/g> { ?s (<http://pg-ripple.org/conf_path/https://pp.test/dep/0.5>|<https://pp.test/none>) ?o } }');
+SELECT count(*) AS conf_graph_var,
+       (SELECT count(*) FROM pp_closure WHERE s = 'n0') AS expected
+FROM pg_ripple.sparql('SELECT ?g ?o WHERE { GRAPH ?g { <https://pp.test/n0> (<http://pg-ripple.org/conf_path/https://pp.test/dep/0.5>|<https://pp.test/none>) ?o } }');
+SELECT count(*) AS conf_dag_from_a, count(DISTINCT r->>'o') AS distinct_objects
+FROM pg_ripple.sparql('SELECT ?o WHERE { GRAPH <https://pp.test/g> { <https://pp.test/a> (<http://pg-ripple.org/conf_path/https://pp.test/dag/0.5>|<https://pp.test/none>) ?o } }') AS t(r);
 RESET temp_file_limit;
 RESET statement_timeout;
 SELECT pg_ripple.drop_graph('https://pp.test/g') >= 0 AS graph_cleaned;

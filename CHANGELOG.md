@@ -15,8 +15,11 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   path: `<n0> <dep>+ ?o` on a ring of 40 nodes with chords exhausted 512 MB of
   temp files in 3.3 s (answer: 40 nodes). They now use a set-semantics `UNION`
   without `CYCLE`; with `max_path_depth` the depth column bounds the recursion,
-  without it the column is constant. `pg:confPath` keeps `CYCLE` (its rows carry
-  a per-path confidence). SHACL `sh:oneOrMorePath`/`sh:zeroOrMorePath` had the
+  without it the column is constant. `pg:confPath` had the same CTE (it filters
+  each edge by its confidence, so the result is the same closure over the kept
+  edges) and gets the same fix, plus `DISTINCT` (a DAG returned an object once per
+  path), the anchor alias of a bound subject ("missing FROM-clause entry for table
+  edge_anchor") and the graph column for `GRAPH ?g`. SHACL `sh:oneOrMorePath`/`sh:zeroOrMorePath` had the
   same SQL (no caller reaches it yet) and get the same fix; SKOS ancestors and
   descendants already used `UNION` with a depth cap of 50 (only a comment said
   `CYCLE`). Tests: `v0147f_property_path_cyclic`, pg_test

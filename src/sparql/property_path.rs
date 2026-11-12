@@ -22,8 +22,8 @@
 //! then keeps one row per path, and the recursion enumerates every simple path
 //! (a ring of 40 nodes with chords exhausted 512 MB of temp files in 3 s).
 //! With `max_path_depth` set, `_depth` counts hops and bounds the recursion;
-//! without it the column is constant.  The confidence path (`pg:confPath`) still
-//! uses `CYCLE`: its rows carry a per-path confidence, so they are not a set.
+//! without it the column is constant.  The confidence path (`pg:confPath`) filters
+//! each edge by its own confidence: the same closure, over the edges it keeps.
 
 use spargebra::algebra::PropertyPathExpression;
 use spargebra::term::NamedNode;
@@ -651,7 +651,7 @@ fn depth_guard_clause(max_depth: i32, cte_name: &str) -> String {
 // ─── v0.87.0 FUZZY-PATH-01: confidence-threshold property path ────────────────
 
 /// Compile a `pg:confPath/predicate_iri/min_confidence` special IRI to a
-/// confidence-filtered `WITH RECURSIVE … CYCLE` CTE.
+/// confidence-filtered `WITH RECURSIVE … UNION` CTE (set semantics, no `CYCLE`).
 ///
 /// `rest` is the portion after the `http://pg-ripple.org/conf_path/` prefix, in
 /// the form `{predicate_iri}/{min_confidence}` (last path component is the float).
@@ -694,11 +694,11 @@ fn compile_conf_path(
             .unwrap_or(false);
             if has_dedicated {
                 format!(
-                    "SELECT vp.s, vp.o, vp.i AS _sid FROM _pg_ripple.vp_{id} vp WHERE 1=1{g_cond}"
+                    "SELECT vp.s, vp.o, vp.g, vp.i AS _sid FROM _pg_ripple.vp_{id} vp WHERE 1=1{g_cond}"
                 )
             } else {
                 format!(
-                    "SELECT vp.s, vp.o, vp.i AS _sid FROM _pg_ripple.vp_rare vp \
+                    "SELECT vp.s, vp.o, vp.g, vp.i AS _sid FROM _pg_ripple.vp_rare vp \
                      WHERE vp.p = {id}{g_cond}"
                 )
             }
@@ -716,11 +716,24 @@ fn compile_conf_path(
         String::new()
     };
 
+    let step_depth = step_depth_expr(max_depth, &format!("_cp{n}"));
+    // GRAPH ?g: carry the graph and keep each path inside one graph, as p+ does.
+    let (g_col, g_anchor, g_step, g_join) = if !g_sel.is_empty() {
+        (
+            ", g",
+            ", edge.g",
+            format!(", _cp{n}.g"),
+            format!(" AND edge2.g = _cp{n}.g"),
+        )
+    } else {
+        ("", "", String::new(), String::new())
+    };
+
     let s_anchor_cond = s_filter
-        .map(|sf| format!("AND edge_anchor.s = {sf}"))
+        .map(|sf| format!("AND edge.s = {sf}"))
         .unwrap_or_default();
     let o_final_cond = o_filter
-        .map(|of| format!("AND NOT _cp{n}._is_cycle AND _cp{n}.o = {of}"))
+        .map(|of| format!("AND _cp{n}.o = {of}"))
         .unwrap_or_default();
 
     // Confidence filter: edges without a row are treated as confidence = 1.0.
@@ -738,18 +751,18 @@ fn compile_conf_path(
     );
 
     format!(
-        "(WITH RECURSIVE _cp{n}(s, o, _depth) AS (\
-           SELECT edge.s, edge.o, 1 \
+        "(WITH RECURSIVE _cp{n}(s, o{g_col}, _depth) AS (\
+           SELECT edge.s, edge.o{g_anchor}, 1 \
            FROM ({vp_expr}) edge \
            WHERE {conf_cond} {s_anchor_cond} \
-           UNION ALL \
-           SELECT _cp{n}.s, edge2.o, _cp{n}._depth + 1 \
+           UNION \
+           SELECT _cp{n}.s, edge2.o{g_step}, {step_depth} \
            FROM _cp{n} \
-           JOIN ({vp_expr}) edge2 ON edge2.s = _cp{n}.o \
+           JOIN ({vp_expr}) edge2 ON edge2.s = _cp{n}.o{g_join} \
            WHERE {conf_cond2} {depth_guard} \
-         ) CYCLE s, o SET _is_cycle USING _cp{n}_path \
-         SELECT s, o{g_sel} FROM _cp{n} \
-         WHERE NOT _is_cycle {o_final_cond}\
+         ) \
+         SELECT DISTINCT s, o{g_sel} FROM _cp{n} \
+         WHERE true {o_final_cond}\
         )",
     )
 }
