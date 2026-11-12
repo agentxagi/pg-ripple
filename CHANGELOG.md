@@ -10,6 +10,33 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ### Fixed
 
+- **SPARQL `p+`/`p*` enumerated paths on cyclic graphs.** The property-path
+  CTEs used `UNION ALL` with `CYCLE s, o SET _is_cycle`, one row per simple
+  path: `<n0> <dep>+ ?o` on a ring of 40 nodes with chords exhausted 512 MB of
+  temp files in 3.3 s (answer: 40 nodes). They now use a set-semantics `UNION`
+  without `CYCLE`; with `max_path_depth` the depth column bounds the recursion,
+  without it the column is constant. `pg:confPath` keeps `CYCLE` (its rows carry
+  a per-path confidence). SHACL `sh:oneOrMorePath`/`sh:zeroOrMorePath` had the
+  same SQL (no caller reaches it yet) and get the same fix; SKOS ancestors and
+  descendants already used `UNION` with a depth cap of 50 (only a comment said
+  `CYCLE`). Tests: `v0147f_property_path_cyclic`, pg_test
+  `test_recursive_sh_paths_are_sets_on_cyclic_graph`.
+
+- **Strata were numbered consumers first.** Dependency edges point from a rule
+  head to its body, and Kahn's order listed consumers before what they read,
+  so plain `infer` (which runs strata in ascending order) evaluated
+  `indirectly_runs_on` before the `depends_on` closure and needed a second
+  pass; a negated predicate could also be read before it was complete. The
+  order is reversed. Tests: `v0147d` (one plain pass converges, the second adds
+  exactly nothing), unit test `test_stratify_producer_before_consumer`.
+
+- **A cached SPARQL translation ignored dedicated tables created by Datalog.**
+  `ensure_htap_tables` did not advance `schema_generation_seq`, which is part of
+  the plan cache key, so a variable-predicate query cached before plain `infer`
+  created a predicate's tables kept reading without them. It now advances the
+  sequence when the predicate had no dedicated table. Test: `v0147d` reuses the
+  cached query across the plain pass.
+
 - **A recursive Datalog rule over a graph with cycles enumerated paths and
   never finished.** `compile_recursive_rule` emitted `WITH RECURSIVE … UNION …
   CYCLE s, o, g SET is_cycle USING cycle_path`. `CYCLE` adds the path to every

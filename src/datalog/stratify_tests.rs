@@ -57,6 +57,28 @@ fn test_stratify_negation_cycle_error() {
 }
 
 #[test]
+fn test_stratify_producer_before_consumer() {
+    // 10 ← 10 (recursive, like depends_on), 20 ← 10 (like indirectly_runs_on),
+    // 30 ← ¬20: every predicate's producers sit in a lower stratum, so one
+    // pass in stratum order reads complete inputs.
+    let rules = vec![
+        make_rule(10, 10, false),
+        make_rule(20, 10, false),
+        make_rule(30, 20, true),
+    ];
+    let result = stratify(&rules).unwrap();
+    let stratum_of = |p: i64| {
+        result
+            .strata
+            .iter()
+            .position(|s| s.derived_predicates.contains(&p))
+            .unwrap()
+    };
+    assert!(stratum_of(10) < stratum_of(20));
+    assert!(stratum_of(20) < stratum_of(30));
+}
+
+#[test]
 fn test_stratify_recursive() {
     // 10 ← 10 (positive self-loop — recursive)
     let rules = vec![make_rule(10, 10, false)];

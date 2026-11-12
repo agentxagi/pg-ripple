@@ -292,6 +292,12 @@ fn topo_sort_sccs(
         return Err("cyclic dependency in SCC DAG (bug in stratifier)".to_owned());
     }
 
+    // Edges point from a rule head to its body predicates, so Kahn's order
+    // lists consumers before what they read.  Strata run in ascending order:
+    // reverse it, so a predicate's producers (and the target of a negation)
+    // get a lower stratum and are complete before it is evaluated.
+    topo_order.reverse();
+
     // Assign stratum index: position in topo_order → stratum.
     let mut scc_stratum: HashMap<usize, usize> = HashMap::new();
     for (stratum, &scc_idx) in topo_order.iter().enumerate() {

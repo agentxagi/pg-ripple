@@ -1,0 +1,120 @@
+-- pg_regress test: SPARQL p+ and p* on a cyclic graph return the closure as a
+-- set (v0147f).
+--
+-- Regression for: the property-path CTEs used UNION ALL with
+-- CYCLE s, o SET _is_cycle, which keeps one row per simple path.  On a ring of
+-- 40 nodes with edges i->i+1 and i->i+2, <n0> <dep>+ ?o exhausted 512 MB of
+-- temp files in 3.3 s; the answer is 40 nodes.  Expected counts come from a
+-- closure computed here without the extension.
+CREATE EXTENSION IF NOT EXISTS pg_ripple;
+SELECT pg_ripple.triple_count() >= 0 AS library_loaded;
+WARNING:  pg_ripple: loaded without shared_preload_libraries; HTAP merge worker, CONSTRUCT writeback, and dictionary cache are disabled. Add pg_ripple to shared_preload_libraries in postgresql.conf.
+ library_loaded 
+----------------
+ t
+(1 row)
+
+SET search_path TO pg_ripple, public;
+SELECT pg_ripple.drop_graph('https://pp.test/g') >= 0 AS graph_reset;
+ graph_reset 
+-------------
+ t
+(1 row)
+
+CREATE TEMP TABLE pp_edge (s text, o text);
+INSERT INTO pp_edge
+SELECT 'n' || i, 'n' || ((i + d) % 40) FROM generate_series(0, 39) AS i, (VALUES (1), (2)) AS v(d);
+SELECT pg_ripple.load_nquads(string_agg(
+         format('<https://pp.test/%s> <https://pp.test/dep> <https://pp.test/%s> <https://pp.test/g> .', s, o),
+         E'\n')) AS edges_loaded
+FROM pp_edge;
+ edges_loaded 
+--------------
+           80
+(1 row)
+
+CREATE TEMP TABLE pp_closure (s text, o text, PRIMARY KEY (s, o));
+INSERT INTO pp_closure SELECT s, o FROM pp_edge;
+DO $$
+DECLARE
+    added bigint;
+BEGIN
+    LOOP
+        INSERT INTO pp_closure
+        SELECT DISTINCT a.s, b.o FROM pp_closure a JOIN pp_closure b ON b.s = a.o
+        ON CONFLICT DO NOTHING;
+        GET DIAGNOSTICS added = ROW_COUNT;
+        EXIT WHEN added = 0;
+    END LOOP;
+END $$;
+SET statement_timeout = '30s';
+SET temp_file_limit = '256MB';
+-- Default max_path_depth (100).
+SELECT count(*) AS plus_from_n0,
+       (SELECT count(*) FROM pp_closure WHERE s = 'n0') AS expected
+FROM pg_ripple.sparql('SELECT ?o WHERE { GRAPH <https://pp.test/g> { <https://pp.test/n0> <https://pp.test/dep>+ ?o } }');
+ plus_from_n0 | expected 
+--------------+----------
+           40 |       40
+(1 row)
+
+SELECT count(*) AS plus_to_n5,
+       (SELECT count(*) FROM pp_closure WHERE o = 'n5') AS expected
+FROM pg_ripple.sparql('SELECT ?s WHERE { GRAPH <https://pp.test/g> { ?s <https://pp.test/dep>+ <https://pp.test/n5> } }');
+ plus_to_n5 | expected 
+------------+----------
+         40 |       40
+(1 row)
+
+SELECT count(*) AS plus_all_pairs,
+       (SELECT count(*) FROM pp_closure) AS expected
+FROM pg_ripple.sparql('SELECT ?s ?o WHERE { GRAPH <https://pp.test/g> { ?s <https://pp.test/dep>+ ?o } }');
+ plus_all_pairs | expected 
+----------------+----------
+           1600 |     1600
+(1 row)
+
+SELECT count(*) AS star_from_n0,
+       (SELECT count(*) FROM (SELECT o FROM pp_closure WHERE s = 'n0' UNION SELECT 'n0') x) AS expected
+FROM pg_ripple.sparql('SELECT ?o WHERE { GRAPH <https://pp.test/g> { <https://pp.test/n0> <https://pp.test/dep>* ?o } }');
+ star_from_n0 | expected 
+--------------+----------
+           40 |       40
+(1 row)
+
+SELECT count(*) AS plus_graph_var,
+       (SELECT count(*) FROM pp_closure WHERE s = 'n0') AS expected
+FROM pg_ripple.sparql('SELECT ?g ?o WHERE { GRAPH ?g { <https://pp.test/n0> <https://pp.test/dep>+ ?o } }');
+ plus_graph_var | expected 
+----------------+----------
+             40 |       40
+(1 row)
+
+-- Without a depth limit, and with a limit of one hop.
+SET pg_ripple.max_path_depth = 0;
+SELECT count(*) AS plus_unbounded,
+       (SELECT count(*) FROM pp_closure WHERE s = 'n0') AS expected
+FROM pg_ripple.sparql('SELECT ?o WHERE { GRAPH <https://pp.test/g> { <https://pp.test/n0> <https://pp.test/dep>+ ?o } }');
+ plus_unbounded | expected 
+----------------+----------
+             40 |       40
+(1 row)
+
+SET pg_ripple.max_path_depth = 1;
+SELECT count(*) AS plus_one_hop,
+       (SELECT count(*) FROM pp_edge WHERE s = 'n0') AS expected
+FROM pg_ripple.sparql('SELECT ?o WHERE { GRAPH <https://pp.test/g> { <https://pp.test/n0> <https://pp.test/dep>+ ?o } }');
+ plus_one_hop | expected 
+--------------+----------
+            2 |        2
+(1 row)
+
+RESET pg_ripple.max_path_depth;
+RESET temp_file_limit;
+RESET statement_timeout;
+SELECT pg_ripple.drop_graph('https://pp.test/g') >= 0 AS graph_cleaned;
+ graph_cleaned 
+---------------
+ t
+(1 row)
+

@@ -4,8 +4,8 @@
 //!
 //! | SPARQL | Operator | SQL strategy |
 //! |---|---|---|
-//! | `p+`  | OneOrMore  | `WITH RECURSIVE` + `CYCLE` (PG18) |
-//! | `p*`  | ZeroOrMore | `WITH RECURSIVE` + `CYCLE` + zero-hop UNION |
+//! | `p+`  | OneOrMore  | `WITH RECURSIVE` + set-semantics `UNION` |
+//! | `p*`  | ZeroOrMore | `WITH RECURSIVE` + set-semantics `UNION` + zero-hop rows |
 //! | `p?`  | ZeroOrOne  | `UNION` of direct + COALESCE identity |
 //! | `a/b` | Sequence   | chained joins via subquery |
 //! | `a\|b`| Alternative| `UNION ALL` |
@@ -14,17 +14,16 @@
 //!
 //! Every generated subquery returns `(s BIGINT, o BIGINT)` columns.
 //!
-//! # Cycle detection
+//! # Cycles
 //!
-//! Uses PostgreSQL 18's `CYCLE` clause for O(1) membership checks.
-//! PROPPATH-CYCLE-01 (v0.80.0): the CYCLE clause tracks both `s` and `o` so
-//! that directed graphs with parallel edges (same s, same o via different
-//! intermediate predicates) and self-loops are correctly detected as cycles:
-//! ```sql
-//! WITH RECURSIVE _path(s, o) AS (...)
-//! CYCLE s, o SET _is_cycle USING _cycle_path
-//! SELECT s, o FROM _path WHERE NOT _is_cycle
-//! ```
+//! The `p+` and `p*` CTEs use a set-semantics `UNION`, which discards a row already
+//! produced, so on a cyclic graph the recursion stops at the closure.  They do
+//! not use PostgreSQL's `CYCLE` clause: it adds the path to every row, `UNION`
+//! then keeps one row per path, and the recursion enumerates every simple path
+//! (a ring of 40 nodes with chords exhausted 512 MB of temp files in 3 s).
+//! With `max_path_depth` set, `_depth` counts hops and bounds the recursion;
+//! without it the column is constant.  The confidence path (`pg:confPath`) still
+//! uses `CYCLE`: its rows carry a per-path confidence, so they are not a set.
 
 use spargebra::algebra::PropertyPathExpression;
 use spargebra::term::NamedNode;
@@ -265,6 +264,7 @@ pub fn compile_path(
             let cte_name = format!("_opm{n}");
             let base_sql = compile_path(inner, None, None, ctx, max_depth, graph_filter, include_g);
             let depth_guard = depth_guard_clause(max_depth, &cte_name);
+            let step_depth = step_depth_expr(max_depth, &cte_name);
             let anchor_where = s_filter
                 .map(|sf| format!(" WHERE _anchor{n}.s = {sf}"))
                 .unwrap_or_default();
@@ -276,28 +276,28 @@ pub fn compile_path(
                     "(WITH RECURSIVE {cte_name}(s, o, g, _depth) AS (\
                      SELECT _anchor{n}.s, _anchor{n}.o, _anchor{n}.g, 1 \
                      FROM {base_sql} AS _anchor{n}{anchor_where} \
-                     UNION ALL \
-                     SELECT {cte_name}.s, _step{n}.o, {cte_name}.g, {cte_name}._depth + 1 \
+                     UNION \
+                     SELECT {cte_name}.s, _step{n}.o, {cte_name}.g, {step_depth} \
                      FROM {cte_name} \
                      JOIN {base_sql} AS _step{n} ON {cte_name}.o = _step{n}.s AND {cte_name}.g = _step{n}.g \
                      {depth_guard}\
-                     ) CYCLE s, o SET _is_cycle USING _cycle_path \
+                     ) \
                      SELECT DISTINCT s, o, g FROM {cte_name} \
-                     WHERE NOT _is_cycle{final_where})"
+                     WHERE true{final_where})"
                 )
             } else {
                 format!(
                     "(WITH RECURSIVE {cte_name}(s, o, _depth) AS (\
                      SELECT _anchor{n}.s, _anchor{n}.o, 1 \
                      FROM {base_sql} AS _anchor{n}{anchor_where} \
-                     UNION ALL \
-                     SELECT {cte_name}.s, _step{n}.o, {cte_name}._depth + 1 \
+                     UNION \
+                     SELECT {cte_name}.s, _step{n}.o, {step_depth} \
                      FROM {cte_name} \
                      JOIN {base_sql} AS _step{n} ON {cte_name}.o = _step{n}.s \
                      {depth_guard}\
-                     ) CYCLE s, o SET _is_cycle USING _cycle_path \
+                     ) \
                      SELECT DISTINCT s, o FROM {cte_name} \
-                     WHERE NOT _is_cycle{final_where})"
+                     WHERE true{final_where})"
                 )
             }
         }
@@ -308,6 +308,7 @@ pub fn compile_path(
             let cte_name = format!("_zom{n}");
             let base_sql = compile_path(inner, None, None, ctx, max_depth, graph_filter, include_g);
             let depth_guard = depth_guard_clause(max_depth, &cte_name);
+            let step_depth = step_depth_expr(max_depth, &cte_name);
 
             // One-hop anchor: start from s_filter if given, otherwise from all.
             let one_hop_where = s_filter
@@ -358,14 +359,14 @@ pub fn compile_path(
                        UNION ALL \
                        {zero_hop} \
                      ) AS _anc{n} \
-                     UNION ALL \
-                     SELECT {cte_name}.s, _step{n}.o, {cte_name}.g, {cte_name}._depth + 1 \
+                     UNION \
+                     SELECT {cte_name}.s, _step{n}.o, {cte_name}.g, {step_depth} \
                      FROM {cte_name} \
                      JOIN {base_sql} AS _step{n} ON {cte_name}.o = _step{n}.s AND {cte_name}.g = _step{n}.g \
                      {depth_guard}\
-                     ) CYCLE s, o SET _is_cycle USING _cycle_path \
+                     ) \
                      SELECT DISTINCT s, o, g FROM {cte_name} \
-                     WHERE NOT _is_cycle{final_where})"
+                     WHERE true{final_where})"
                 )
             } else {
                 // Without graph tracking: existing behavior.
@@ -407,14 +408,14 @@ pub fn compile_path(
                        UNION ALL \
                        {zero_hop} \
                      ) AS _anc{n} \
-                     UNION ALL \
-                     SELECT {cte_name}.s, _step{n}.o, {cte_name}._depth + 1 \
+                     UNION \
+                     SELECT {cte_name}.s, _step{n}.o, {step_depth} \
                      FROM {cte_name} \
                      JOIN {base_sql} AS _step{n} ON {cte_name}.o = _step{n}.s \
                      {depth_guard}\
-                     ) CYCLE s, o SET _is_cycle USING _cycle_path \
+                     ) \
                      SELECT DISTINCT s, o FROM {cte_name} \
-                     WHERE NOT _is_cycle{final_where})"
+                     WHERE true{final_where})"
                 )
             }
         }
@@ -628,6 +629,17 @@ fn build_all_predicates_with_p() -> String {
 
 /// Build a `WHERE _cte._depth < {max_depth}` guard clause for recursive CTEs.
 /// If max_depth is 0 (GUC default interpretation: unlimited), no guard is emitted.
+/// Depth of a recursive step.  With a depth limit the column counts hops; without
+/// one it stays constant, so the set-semantics UNION sees a repeated (s, o) as a
+/// duplicate and the recursion stops at the closure.
+fn step_depth_expr(max_depth: i32, cte_name: &str) -> String {
+    if max_depth <= 0 {
+        "1".to_owned()
+    } else {
+        format!("{cte_name}._depth + 1")
+    }
+}
+
 fn depth_guard_clause(max_depth: i32, cte_name: &str) -> String {
     if max_depth <= 0 {
         String::new()
