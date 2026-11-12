@@ -10,6 +10,23 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ### Fixed
 
+- **An inference pass copied into the HTAP delta the rows already merged into
+  main.** The plain path (`infer`, rows with `source = 1`) and the semi-naive
+  materialisation insert into `vp_{id}_delta` with `ON CONFLICT DO NOTHING`,
+  which only sees the delta: after a merge, every pass copied the derived rows
+  back (24,293 rows per pass on one production predicate with an empty delta,
+  past `merge_threshold`, so one merge cycle per pass), and `infer_with_stats`
+  counted them as derived. Both now skip the rows the head's view returns (main
+  minus tombstones, plus delta). A deleted but still derivable triple is not in
+  the view, so it is rederived and survives the next merge; asserted rows that
+  the plain path leaves in `vp_rare` are not in it either and are copied as
+  before. Test: `v0147h_infer_skips_visible_rows`.
+
+- **The first schema change on a new database did not invalidate cached SPARQL
+  plans.** `current_schema_generation()` read `last_value`, which is 1 both
+  before and after the first `nextval`; it now reads 0 until `is_called`. Test:
+  `test_schema_generation_first_bump_changes_the_key`.
+
 - **SPARQL `p+`/`p*` enumerated paths on cyclic graphs.** The property-path
   CTEs used `UNION ALL` with `CYCLE s, o SET _is_cycle`, one row per simple
   path: `<n0> <dep>+ ?o` on a ring of 40 nodes with chords exhausted 512 MB of
@@ -132,8 +149,8 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   WAL, 4.1 GB in 1 h 45 (66 % of the day's WAL). Only subjects and objects whose
   pattern is new or changed now reach the upsert (anti-join against the current
   table); `ON CONFLICT DO UPDATE … WHERE` alone still locked every conflicting row
-  and wrote a lock record per row (10.1 MB of WAL per rebuild of a test set on
-  main, 1.18 MB with the `WHERE` only, 40 bytes with the anti-join). Test:
+  and wrote a lock record per row (10.1 MB of WAL per `compact()` of a test set
+  on main, 1.18 MB with the `WHERE` only, 40 bytes with the anti-join). Test:
   `v0147g_pattern_rebuild_no_rewrite` (a second rebuild neither rewrites nor locks
   a row: the main branch rewrote all 37).
 

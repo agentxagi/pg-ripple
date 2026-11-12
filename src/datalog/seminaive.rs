@@ -30,12 +30,18 @@ use var_pred::run_var_pred_rule;
 /// keep `vp_rare` (source = 1).  Both inference paths — plain and semi-naive —
 /// land in the same storage, so `ON CONFLICT` deduplicates instead of
 /// materialising the same logical fact twice with distinct SIDs.
+///
+/// The delta's `ON CONFLICT` only sees the delta, so rows the view already
+/// returns (main minus tombstones, plus delta) are skipped: otherwise every pass
+/// after a merge copied the merged rows back and counted them as derived.
 pub(crate) fn materialise_derived_rows(pred_id: i64, delta_table: &str) -> i64 {
     let cnt = if super::compiler::has_dedicated_vp(pred_id) {
         Spi::get_one::<i64>(&format!(
             "WITH ins AS ( \
                INSERT INTO _pg_ripple.vp_{pred_id}_delta (s, o, g, source) \
-               SELECT s, o, g, 1 FROM {delta_table} \
+               SELECT d.s, d.o, d.g, 1 FROM {delta_table} d \
+               WHERE NOT EXISTS (SELECT 1 FROM _pg_ripple.vp_{pred_id} v \
+                   WHERE v.s = d.s AND v.o = d.o AND v.g = d.g) \
                ON CONFLICT DO NOTHING RETURNING 1 \
              ) SELECT COUNT(*)::bigint FROM ins"
         ))

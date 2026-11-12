@@ -152,4 +152,16 @@ mod tests {
             .unwrap();
         });
     }
+
+    // A new database: before the first nextval, last_value already holds the
+    // start value (1) with is_called = false, so reading last_value alone gave 1
+    // before and after the first bump and the plan-cache key did not change.
+    // RESTART is transactional (new relfilenode), so the test's rollback undoes it.
+    #[pg_test]
+    fn test_schema_generation_first_bump_changes_the_key() {
+        Spi::run("ALTER SEQUENCE _pg_ripple.schema_generation_seq RESTART").unwrap();
+        assert_eq!(crate::storage::current_schema_generation(), 0);
+        crate::storage::bump_schema_generation();
+        assert_eq!(crate::storage::current_schema_generation(), 1);
+    }
 }

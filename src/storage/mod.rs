@@ -305,9 +305,14 @@ pub(crate) fn bump_schema_generation() {
 /// Read the current value of `_pg_ripple.schema_generation_seq` without advancing it.
 ///
 /// Returns 0 on error (the sequence may not exist during fresh install before the
-/// v0.95.0 migration SQL has run). (M15-10, v0.95.0)
+/// v0.95.0 migration SQL has run). (M15-10, v0.95.0)  Before the first `nextval`
+/// `last_value` already holds the start value (1, `is_called` false), so it reads
+/// as 0 there: otherwise the first advance on a new database left the plan-cache
+/// key unchanged.
 pub(crate) fn current_schema_generation() -> i64 {
-    Spi::get_one::<i64>("SELECT last_value FROM _pg_ripple.schema_generation_seq")
+    Spi::get_one::<i64>(
+        "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM _pg_ripple.schema_generation_seq",
+    )
         .unwrap_or(None)
         .unwrap_or(0)
 }

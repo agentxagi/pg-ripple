@@ -54,7 +54,7 @@ CREATE TEMP TABLE pat_before AS SELECT * FROM pat_rows;
 SELECT pg_ripple.compact() >= 0 AS second_compact;
 SELECT count(*) FILTER (WHERE a.x <> b.x) AS rewritten,
        count(*) FILTER (WHERE a.xm <> b.xm) AS locked
-FROM pat_rows a JOIN pat_before b USING (kind, id);
+FROM pat_rows a JOIN pat_before b USING (kind, id) JOIN pat_ids i ON i.id = a.id;
 
 -- A new subject is inserted and a changed pattern is updated; the rest stays put.
 SELECT pg_ripple.insert_triple('<https://pat.test/s100>', '<https://pat.test/q>', '<https://pat.test/z>',
@@ -62,7 +62,7 @@ SELECT pg_ripple.insert_triple('<https://pat.test/s100>', '<https://pat.test/q>'
 SELECT pg_ripple.compact() >= 0 AS third_compact;
 SELECT count(*) FILTER (WHERE a.x <> b.x) AS rewritten,
        count(*) FILTER (WHERE a.xm <> b.xm) AS locked
-FROM pat_rows a JOIN pat_before b USING (kind, id);
+FROM pat_rows a JOIN pat_before b USING (kind, id) JOIN pat_ids i ON i.id = a.id;
 DELETE FROM pat_before;
 INSERT INTO pat_before SELECT * FROM pat_rows;
 SELECT pg_ripple.insert_triple('<https://pat.test/s100>', '<https://pat.test/r>', '<https://pat.test/z>',
