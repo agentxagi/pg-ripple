@@ -104,7 +104,7 @@ SELECT pg_ripple.compact() >= 0 AS second_compact;
 
 SELECT count(*) FILTER (WHERE a.x <> b.x) AS rewritten,
        count(*) FILTER (WHERE a.xm <> b.xm) AS locked
-FROM pat_rows a JOIN pat_before b USING (kind, id);
+FROM pat_rows a JOIN pat_before b USING (kind, id) JOIN pat_ids i ON i.id = a.id;
  rewritten | locked 
 -----------+--------
          0 |      0
@@ -126,7 +126,7 @@ SELECT pg_ripple.compact() >= 0 AS third_compact;
 
 SELECT count(*) FILTER (WHERE a.x <> b.x) AS rewritten,
        count(*) FILTER (WHERE a.xm <> b.xm) AS locked
-FROM pat_rows a JOIN pat_before b USING (kind, id);
+FROM pat_rows a JOIN pat_before b USING (kind, id) JOIN pat_ids i ON i.id = a.id;
  rewritten | locked 
 -----------+--------
          0 |      0

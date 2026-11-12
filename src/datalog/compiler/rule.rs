@@ -8,7 +8,7 @@ use super::{
     VarMap, arith_op_sql, build_antijoin_on_cond, build_join_cond, build_not_exists_conds,
     compile_guard_sql, const_sql, cost_order_atoms, estimate_pred_cardinality, guard_fully_bound,
     has_dedicated_vp, is_recursive_rule, render_comparison_term, resolve_predicate_id,
-    resolve_term_ref, vp_read_expr, vp_table,
+    resolve_term_ref, skip_visible, vp_read_expr, vp_table,
 };
 use crate::datalog::{Atom, BodyLiteral, Rule, Term};
 
@@ -116,7 +116,7 @@ fn compile_single_rule_inner(
 ///    that atom's `JOIN … ON` clause instead of the outer `WHERE` clause.
 fn compile_nonrecursive_rule(
     rule: &Rule,
-    _head_pred: i64,
+    head_pred: i64,
     _head_g_expr: &str,
     target: &str,
     mark_inferred: bool,
@@ -548,11 +548,15 @@ fn compile_nonrecursive_rule(
         ("s, o, g", "")
     };
 
+    let select_sql = format!(
+        "SELECT {select_s}, {select_o}, {select_g}{head_source}\n\
+         FROM {from_str}\n\
+         {where_str}"
+    );
     Ok(format!(
         "INSERT INTO {target} ({head_cols})\n\
-         SELECT {select_s}, {select_o}, {select_g}{head_source}\n\
-         FROM {from_str}\n\
-         {where_str}\n\
-         ON CONFLICT DO NOTHING"
+         {}\n\
+         ON CONFLICT DO NOTHING",
+        skip_visible(select_sql, head_pred, mark_inferred)
     ))
 }

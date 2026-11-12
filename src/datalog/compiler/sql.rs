@@ -5,7 +5,8 @@ use crate::datalog::{AggFunc, AggregateLiteral, Atom, BodyLiteral, Rule, StringB
 
 use super::{
     VarMap, arith_op_sql, build_join_cond, build_not_exists_conds, compare_op_sql, const_sql,
-    head_g_select_expr, is_recursive_rule, render_comparison_term, vp_read_expr, vp_table,
+    head_g_select_expr, is_recursive_rule, render_comparison_term, skip_visible, vp_read_expr,
+    vp_table,
 };
 
 pub(super) fn compile_recursive_rule(
@@ -170,6 +171,10 @@ pub(super) fn compile_recursive_rule(
         // Rows are distinct per (s, o, g, depth), so the CTE holds at most
         // (max_depth + 1) rows per derived triple and stops at max_depth.
         // DISTINCT keeps one insert attempt per triple.
+        let select_sql = format!(
+            "SELECT DISTINCT {select_s}, {select_o}, {cte_name}.g{head_source}\n\
+             FROM {cte_name}"
+        );
         Ok(format!(
             "WITH RECURSIVE {cte_name}(s, o, g, depth) AS (\n\
                  {base_sql_depth}\n\
@@ -177,9 +182,9 @@ pub(super) fn compile_recursive_rule(
                  {rec_sql_depth}\n\
              )\n\
              INSERT INTO {target} ({head_cols})\n\
-             SELECT DISTINCT {select_s}, {select_o}, {cte_name}.g{head_source}\n\
-             FROM {cte_name}\n\
-             ON CONFLICT DO NOTHING"
+             {}\n\
+             ON CONFLICT DO NOTHING",
+            skip_visible(select_sql, head_pred, mark_inferred)
         ))
     } else {
         // VAL-207: plain-path (mark_inferred) INSERTs carry source = 1.
@@ -189,6 +194,10 @@ pub(super) fn compile_recursive_rule(
             ("s, o, g", "")
         };
 
+        let select_sql = format!(
+            "SELECT {select_s}, {select_o}, {cte_name}.g{head_source}\n\
+             FROM {cte_name}"
+        );
         Ok(format!(
             "WITH RECURSIVE {cte_name}(s, o, g) AS (\n\
                  {base_sql}\n\
@@ -196,9 +205,9 @@ pub(super) fn compile_recursive_rule(
                  {rec_sql}\n\
              )\n\
              INSERT INTO {target} ({head_cols})\n\
-             SELECT {select_s}, {select_o}, {cte_name}.g{head_source}\n\
-             FROM {cte_name}\n\
-             ON CONFLICT DO NOTHING"
+             {}\n\
+             ON CONFLICT DO NOTHING",
+            skip_visible(select_sql, head_pred, mark_inferred)
         ))
     }
 }
