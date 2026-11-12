@@ -10,25 +10,6 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
 
 ### Fixed
 
-- **Every merge cycle rewrote `subject_patterns` and `object_patterns`.**
-  `rebuild_subject_patterns`/`rebuild_object_patterns` upserted every subject and
-  object with `DO UPDATE SET pattern = EXCLUDED.pattern`, also when the pattern
-  was the same: in production 159 k and 266 k rows per cycle, 47 MB and 95 MB of
-  WAL, 4.1 GB in 1 h 45 (66 % of the day's WAL). The update now skips a row whose
-  pattern did not change (`WHERE … IS DISTINCT FROM EXCLUDED.pattern`). Test:
-  `v0147g_pattern_rebuild_no_rewrite` (a second rebuild rewrites 0 rows; the main
-  branch rewrote all 37).
-
-- **Background workers never reported table statistics.** A background worker
-  has to call `pgstat_report_stat` itself (PostgreSQL 18's `worker_spi` does it
-  after each commit), so `pg_stat_user_tables` showed `n_tup_upd = 0` and
-  `n_dead_tup = 0` after the merge worker rewrote 10.4 million rows, autovacuum
-  never ran, and the two pattern tables grew to 3.1 GB and 6.2 GB for ~40 MB of
-  live data. The merge worker and the logical apply worker now report after each
-  cycle, outside the transaction. Manual probe on a disposable PostgreSQL 18.6
-  with the worker running: `vp_N_main` inserts, `vp_N_delta` deletes and the
-  pattern upserts show up in `pg_stat_user_tables` (all 0 before).
-
 - **A recursive Datalog rule over a graph with cycles enumerated paths and
   never finished.** `compile_recursive_rule` emitted `WITH RECURSIVE … UNION …
   CYCLE s, o, g SET is_cycle USING cycle_path`. `CYCLE` adds the path to every
@@ -105,6 +86,25 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   stays at 0.141.0. Test: `v0147b_literal_lookup_readonly` (stored literals on
   a fresh connection, the cached SELECT before and after a late load, and a
   read-only role asking for stored and unknown literals).
+
+- **Every merge cycle rewrote `subject_patterns` and `object_patterns`.**
+  `rebuild_subject_patterns`/`rebuild_object_patterns` upserted every subject and
+  object with `DO UPDATE SET pattern = EXCLUDED.pattern`, also when the pattern
+  was the same: in production 159 k and 266 k rows per cycle, 47 MB and 95 MB of
+  WAL, 4.1 GB in 1 h 45 (66 % of the day's WAL). The update now skips a row whose
+  pattern did not change (`WHERE … IS DISTINCT FROM EXCLUDED.pattern`). Test:
+  `v0147g_pattern_rebuild_no_rewrite` (a second rebuild rewrites 0 rows; the main
+  branch rewrote all 37).
+
+- **Background workers never reported table statistics.** A background worker
+  has to call `pgstat_report_stat` itself (PostgreSQL 18's `worker_spi` does it
+  after each commit), so `pg_stat_user_tables` showed `n_tup_upd = 0` and
+  `n_dead_tup = 0` after the merge worker rewrote 10.4 million rows, autovacuum
+  never ran, and the two pattern tables grew to 3.1 GB and 6.2 GB for ~40 MB of
+  live data. The merge worker and the logical apply worker now report after each
+  cycle, outside the transaction. Manual probe on a disposable PostgreSQL 18.6
+  with the worker running: `vp_N_main` inserts, `vp_N_delta` deletes and the
+  pattern upserts show up in `pg_stat_user_tables` (all 0 before).
 
 ## [0.141.0]
 
