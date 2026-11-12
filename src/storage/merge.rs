@@ -833,10 +833,12 @@ pub fn merge_all() -> i64 {
 ///
 /// For each subject, records the sorted array of all predicates it appears in.
 /// Called by the merge worker after each generation merge.
-/// Every merge cycle calls both rebuilds over all subjects and objects; a row whose
-/// pattern did not change is left alone (`WHERE … IS DISTINCT FROM`), so a cycle
-/// writes only the patterns that changed instead of rewriting the whole table
-/// (47 MB and 95 MB of WAL per cycle in production before this).
+/// Every merge cycle calls both rebuilds over all subjects and objects.  Only rows
+/// whose pattern is new or changed reach the upsert (anti-join against the current
+/// table): `ON CONFLICT DO UPDATE` locks a conflicting row before it evaluates its
+/// `WHERE`, so filtering only there still wrote a lock record per row.  An unchanged
+/// row is neither rewritten nor locked (production before this: 47 MB and 95 MB of
+/// WAL per cycle).
 pub fn rebuild_subject_patterns() {
     // Collect all HTAP predicate IDs (predicates with dedicated VP tables).
     // Predicate with table_oid IS NOT NULL are those promoted from vp_rare to have
@@ -873,9 +875,12 @@ pub fn rebuild_subject_patterns() {
     Spi::run_with_args(
         &format!(
             "INSERT INTO _pg_ripple.subject_patterns (s, pattern) \
-             SELECT s, array_agg(DISTINCT p ORDER BY p) \
-             FROM ({union_sql}) AS all_triples \
-             GROUP BY s \
+             SELECT n.s, n.pattern \
+             FROM (SELECT s, array_agg(DISTINCT p ORDER BY p) AS pattern \
+                   FROM ({union_sql}) AS all_triples \
+                   GROUP BY s) AS n \
+             LEFT JOIN _pg_ripple.subject_patterns AS cur ON cur.s = n.s \
+             WHERE cur.pattern IS DISTINCT FROM n.pattern \
              ON CONFLICT (s) DO UPDATE \
                  SET pattern = EXCLUDED.pattern \
                  WHERE _pg_ripple.subject_patterns.pattern IS DISTINCT FROM EXCLUDED.pattern"
@@ -918,9 +923,12 @@ pub fn rebuild_object_patterns() {
     Spi::run_with_args(
         &format!(
             "INSERT INTO _pg_ripple.object_patterns (o, pattern) \
-             SELECT o, array_agg(DISTINCT p ORDER BY p) \
-             FROM ({union_sql}) AS all_triples \
-             GROUP BY o \
+             SELECT n.o, n.pattern \
+             FROM (SELECT o, array_agg(DISTINCT p ORDER BY p) AS pattern \
+                   FROM ({union_sql}) AS all_triples \
+                   GROUP BY o) AS n \
+             LEFT JOIN _pg_ripple.object_patterns AS cur ON cur.o = n.o \
+             WHERE cur.pattern IS DISTINCT FROM n.pattern \
              ON CONFLICT (o) DO UPDATE \
                  SET pattern = EXCLUDED.pattern \
                  WHERE _pg_ripple.object_patterns.pattern IS DISTINCT FROM EXCLUDED.pattern"

@@ -91,10 +91,13 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   `rebuild_subject_patterns`/`rebuild_object_patterns` upserted every subject and
   object with `DO UPDATE SET pattern = EXCLUDED.pattern`, also when the pattern
   was the same: in production 159 k and 266 k rows per cycle, 47 MB and 95 MB of
-  WAL, 4.1 GB in 1 h 45 (66 % of the day's WAL). The update now skips a row whose
-  pattern did not change (`WHERE … IS DISTINCT FROM EXCLUDED.pattern`). Test:
-  `v0147g_pattern_rebuild_no_rewrite` (a second rebuild rewrites 0 rows; the main
-  branch rewrote all 37).
+  WAL, 4.1 GB in 1 h 45 (66 % of the day's WAL). Only subjects and objects whose
+  pattern is new or changed now reach the upsert (anti-join against the current
+  table); `ON CONFLICT DO UPDATE … WHERE` alone still locked every conflicting row
+  and wrote a lock record per row (10.1 MB of WAL per rebuild of a test set on
+  main, 1.18 MB with the `WHERE` only, 40 bytes with the anti-join). Test:
+  `v0147g_pattern_rebuild_no_rewrite` (a second rebuild neither rewrites nor locks
+  a row: the main branch rewrote all 37).
 
 - **Background workers never reported table statistics.** A background worker
   has to call `pgstat_report_stat` itself (PostgreSQL 18's `worker_spi` does it

@@ -916,9 +916,13 @@ pub(crate) fn reload_config() {
 /// right after `CommitTransactionCommand()`; it must run outside a transaction
 /// (`pgstat.c` asserts `!IsTransactionOrTransactionBlock()`).
 pub(crate) fn report_table_stats() {
-    // SAFETY: called by a background worker connected to a database, between
-    // transactions; it only flushes this process's pending statistics entries.
+    // SAFETY: called by a background worker connected to a database; it only
+    // flushes this process's pending statistics entries.  Inside a transaction
+    // the pending entries are still in use (an assert-free build would read freed
+    // memory), so it is skipped there, as PostgreSQL's own apply worker does.
     unsafe {
-        pg_sys::pgstat_report_stat(true);
+        if !pg_sys::IsTransactionOrTransactionBlock() {
+            pg_sys::pgstat_report_stat(true);
+        }
     }
 }
