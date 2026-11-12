@@ -180,7 +180,7 @@ pub extern "C-unwind" fn pg_ripple_logical_apply_worker_main(_arg: pg_sys::Datum
 
     while BackgroundWorker::wait_latch(Some(Duration::from_secs(5))) {
         if BackgroundWorker::sighup_received() {
-            // Re-read configuration.
+            crate::worker::reload_config();
         }
         if BackgroundWorker::sigterm_received() {
             break;

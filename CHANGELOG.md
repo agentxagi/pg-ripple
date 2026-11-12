@@ -106,6 +106,17 @@ Versions correspond to the milestones in [ROADMAP.md](ROADMAP.md).
   with the worker running: `vp_N_main` inserts, `vp_N_delta` deletes and the
   pattern upserts show up in `pg_stat_user_tables` (all 0 before).
 
+- **SIGHUP was logged as "configuration reloaded" but reloaded nothing.**
+  pgrx's handler only sets `ConfigReloadPending` and the latch; the extension
+  never called `ProcessConfigFile`, so `ALTER SYSTEM … ; pg_reload_conf()` did
+  not reach the workers (production: `merge_threshold` 10 000 → 100 000 and the
+  next merge cycle still used 10 000). The merge, logical apply and CDC cleanup
+  workers now clear the flag and call `ProcessConfigFile(PGC_SIGHUP)` outside a
+  transaction, as PostgreSQL 18's `worker_spi` does; the merge worker also
+  re-reads `merge_interval_secs`. Manual probe (worker running,
+  `merge_threshold = 10` in the file, then `ALTER SYSTEM … = 1000000` and
+  reload, 50 inserts): main merged the delta within 10 s, the fix did not.
+
 ## [0.141.0]
 
 Cross-graph justification: the graph-scoped `justify(s, p, o, g)` resolves

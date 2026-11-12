@@ -411,7 +411,8 @@ pub extern "C-unwind" fn pg_ripple_cdc_slot_cleanup_main(_arg: pg_sys::Datum) {
             break;
         }
         if BackgroundWorker::sighup_received() {
-            // GUCs may have changed; re-read on next iteration.
+            // GUCs may have changed: read the configuration file again.
+            crate::worker::reload_config();
         }
 
         // Drop orphaned pg_ripple CDC slots inactive for > timeout_secs.

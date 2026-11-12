@@ -241,7 +241,7 @@ pub extern "C-unwind" fn pg_ripple_merge_worker_main(arg: pg_sys::Datum) {
     }
 
     // Main loop: wait for latch or timeout, then run a merge cycle.
-    let interval_secs = get_merge_interval();
+    let mut interval_secs = get_merge_interval();
     let mut consecutive_errors: u32 = 0;
     // MERGE-HBEAT-01 (v0.82.0): track last heartbeat time.
     let mut last_heartbeat = Instant::now()
@@ -279,7 +279,9 @@ pub extern "C-unwind" fn pg_ripple_merge_worker_main(arg: pg_sys::Datum) {
         ultimo_ciclo = Instant::now();
         let sighup = BackgroundWorker::sighup_received();
         if sighup {
-            // SIGHUP: reload configuration.  The GUC system handles this.
+            // SIGHUP: pgrx's handler only flags it; the file is read here.
+            reload_config();
+            interval_secs = get_merge_interval();
             pgrx::log!(
                 "pg_ripple merge worker {worker_idx}: SIGHUP received — configuration reloaded"
             );
@@ -883,6 +885,24 @@ fn get_merge_interval() -> u64 {
 
 fn get_merge_threshold() -> i64 {
     crate::MERGE_THRESHOLD.get() as i64
+}
+
+/// Re-read the configuration file after a SIGHUP.
+///
+/// pgrx's SIGHUP handler only sets `ConfigReloadPending` and the latch; nothing
+/// reads `postgresql.conf` / `postgresql.auto.conf` again until the worker calls
+/// `ProcessConfigFile`.  Before this, `ALTER SYSTEM … ; SELECT pg_reload_conf()`
+/// was logged as "configuration reloaded" while the worker kept the old values
+/// (production, 11/11/2026: `merge_threshold` 10 000 → 100 000 and the next merge
+/// cycle still used 10 000).  Same sequence as PostgreSQL 18's
+/// `src/test/modules/worker_spi/worker_spi.c`; outside a transaction.
+pub(crate) fn reload_config() {
+    // SAFETY: called from a background worker's main loop between transactions;
+    // `ConfigReloadPending` is the sig_atomic_t flag the SIGHUP handler sets.
+    unsafe {
+        (&raw mut pg_sys::ConfigReloadPending).write_volatile(0);
+        pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
+    }
 }
 
 /// Flush this worker's pending table statistics to the shared statistics.
