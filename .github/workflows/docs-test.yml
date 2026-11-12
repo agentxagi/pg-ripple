@@ -75,7 +75,10 @@ jobs:
         run: cargo pgrx init --pg18 download
 
       - name: Install pg_ripple
-        run: cargo pgrx install --pg-config ~/.pgrx/18.*/pgrx-install/bin/pg_config
+        # The cached ~/.pgrx can hold an older 18.x next to the one `cargo pgrx init` just
+        # downloaded (18.6 and 18.7 on 12/11/2026): the glob then expands to two paths.
+        # Take the newest, the one init registers for pg18.
+        run: cargo pgrx install --pg-config "$(ls -d ~/.pgrx/18.*/pgrx-install/bin/pg_config | sort -V | tail -n 1)"
 
       - name: Start PostgreSQL
         run: cargo pgrx start pg18
