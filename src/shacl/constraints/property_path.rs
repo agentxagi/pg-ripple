@@ -4,8 +4,8 @@
 //! - `sh:inversePath`     — reverse traversal (query `(o, s)`)
 //! - `sh:alternativePath` — union of multiple sub-paths
 //! - Sequence paths       — chained joins
-//! - `sh:zeroOrMorePath`  — `WITH RECURSIVE … CYCLE` (0+ hops)
-//! - `sh:oneOrMorePath`   — `WITH RECURSIVE … CYCLE` (1+ hops)
+//! - `sh:zeroOrMorePath`  — `WITH RECURSIVE … UNION` (0+ hops, set semantics)
+//! - `sh:oneOrMorePath`   — `WITH RECURSIVE … UNION` (1+ hops, set semantics)
 //! - `sh:zeroOrOnePath`   — direct + zero-hop UNION
 
 use pgrx::prelude::*;
@@ -177,15 +177,14 @@ fn compile_inner(
             Some(format!(
                 "WITH RECURSIVE _zom_{n}(s, o) AS (
                     SELECT s, o FROM ({base}) AS _base_{n}{anchor_filter}
-                    UNION ALL
+                    UNION
                     SELECT _zom_{n}.s, _step_{n}.o
                     FROM _zom_{n}
                     JOIN ({base}) AS _step_{n} ON _zom_{n}.o = _step_{n}.s
                 )
-                CYCLE o SET _cyc_{n} USING _cycp_{n}
-                SELECT s, o FROM _zom_{n} WHERE NOT _cyc_{n}
-                UNION ALL
-                SELECT DISTINCT s, s AS o FROM ({base}) AS _zero_{n}"
+                SELECT s, o FROM _zom_{n}
+                UNION
+                SELECT s, s AS o FROM ({base}) AS _zero_{n}"
             ))
         }
 
@@ -199,13 +198,12 @@ fn compile_inner(
             Some(format!(
                 "WITH RECURSIVE _oom_{n}(s, o) AS (
                     SELECT s, o FROM ({base}) AS _base_{n}{anchor_filter}
-                    UNION ALL
+                    UNION
                     SELECT _oom_{n}.s, _step_{n}.o
                     FROM _oom_{n}
                     JOIN ({base}) AS _step_{n} ON _oom_{n}.o = _step_{n}.s
                 )
-                CYCLE o SET _cyc_{n} USING _cycp_{n}
-                SELECT s, o FROM _oom_{n} WHERE NOT _cyc_{n}"
+                SELECT s, o FROM _oom_{n}"
             ))
         }
 
@@ -239,3 +237,7 @@ fn compile_inner(
 pub fn values_for_path_iri(path_iri: &str, focus_id: i64, graph_id: i64) -> Vec<i64> {
     traverse_sh_path(&ShPath::Predicate(path_iri.to_owned()), focus_id, graph_id)
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[path = "property_path_tests.rs"]
+mod property_path_tests;

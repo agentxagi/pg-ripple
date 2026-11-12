@@ -183,6 +183,16 @@ pub fn ensure_htap_tables(pred_id: i64) -> String {
     Spi::run_with_args(&view_sql, &[])
         .unwrap_or_else(|e| pgrx::error!("vp view creation error: {e}"));
 
+    // A predicate that had no dedicated table before this call changes the VP
+    // layout: cached SPARQL translations (a variable-predicate scan lists the
+    // dedicated tables) must not be reused, as after a promotion.
+    let had_table = Spi::get_one_with_args::<bool>(
+        "SELECT table_oid IS NOT NULL FROM _pg_ripple.predicates WHERE id = $1",
+        &[DatumWithOid::from(pred_id)],
+    )
+    .unwrap_or(None)
+    .unwrap_or(false);
+
     // Update predicates catalog: set htap=true and table_oid = view OID.
     Spi::run_with_args(
         "INSERT INTO _pg_ripple.predicates (id, table_oid, triple_count, htap) \
@@ -195,6 +205,9 @@ pub fn ensure_htap_tables(pred_id: i64) -> String {
         ],
     )
     .unwrap_or_else(|e| pgrx::error!("predicates htap upsert error: {e}"));
+    if !had_table {
+        super::bump_schema_generation();
+    }
 
     view
 }

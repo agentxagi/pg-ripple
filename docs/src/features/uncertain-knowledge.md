@@ -99,11 +99,21 @@ FILTER(pg:token_set_ratio(?label, "Smith") > 0.5)
 
 ```sparql
 SELECT ?x WHERE {
-  <http://example.org/alice> <pg:conf_path/http://example.org/knows/0.8> ?x
+  <http://example.org/alice>
+    (<http://pg-ripple.org/conf_path/http://example.org/knows/0.8>|<http://example.org/none>) ?x
 }
 ```
 
-Traverses the `knows` predicate with a minimum confidence threshold of 0.8.
+Returns every node reachable from `alice` through `knows` edges whose confidence
+is at least 0.8 (an edge without a confidence row counts as 1.0), as a set.
+
+Known limitations:
+
+- The special IRI is only recognised inside a property path expression (above, an
+  alternative with an unused predicate forces the path compiler). Used as the plain
+  predicate of a triple pattern it matches nothing.
+- `_pg_ripple.confidence` exists only after confidence is first loaded
+  (`load_triples_with_confidence`); until then every edge counts as 1.0.
 
 ### GUC
 

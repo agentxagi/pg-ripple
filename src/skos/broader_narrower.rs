@@ -88,7 +88,7 @@ mod pg_ripple {
 
     /// Return the `skos:broaderTransitive` closure for a concept.
     ///
-    /// Uses a live `WITH RECURSIVE … CYCLE` query over the VP tables rather than
+    /// Uses a live `WITH RECURSIVE … UNION` query (depth capped at 50) over the VP tables rather than
     /// materialised triples, so it is always up-to-date even before Datalog materialisation.
     /// When `scheme_iri` is non-empty, restricts results to concepts with `skos:inScheme` = scheme.
     /// Depth 0 = the concept itself.

@@ -88,12 +88,23 @@ Pass `analyze := true` to include actual runtime statistics (runs the query).
 
 ## Property path depth
 
-Recursive property paths (`*`, `+`) use `WITH RECURSIVE … CYCLE` with a
+Recursive property paths (`*`, `+`) use `WITH RECURSIVE` with a set-semantics
+`UNION` (no `CYCLE` clause, which enumerates every simple path) and a
 configurable depth limit:
 
 ```sql
-SET pg_ripple.max_path_depth = 32;   -- default: 64
+SET pg_ripple.max_path_depth = 32;   -- default: 100; 0 = unlimited
 ```
+
+The limit has a cost. With `max_path_depth > 0` the recursion carries the hop
+count, so a pair reachable by walks of many lengths is kept once per length.
+On a symmetric, tree-shaped predicate every pair comes back at each depth of the
+same parity: a binary tree of 511 nodes (1,020 edges, 261,121 pairs), unanchored
+`?s <rel>+ ?o`, produced 11.7 million CTE rows and took 20.5 s with the default
+100, against 261 thousand rows and 2.0 s with `0`. The limit is still the only
+cap on long chains, and the recursive `UNION` keeps its hash table in memory, so
+keep it on shared hosts; anchoring the path (a bound subject or object) keeps the
+query small (76 ms for the same tree from one node).
 
 > **Note:** `property_path_max_depth` is a deprecated alias for `max_path_depth`
 > and will be removed in a future release.

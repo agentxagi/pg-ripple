@@ -114,12 +114,11 @@ SELECT hops, g, count(*) AS pairs FROM cyc_within GROUP BY hops, g ORDER BY hops
 CREATE TEMP TABLE cyc_expected AS
 SELECT p, s, o, g FROM cyc_edge WHERE g IN ('a', 'b');
 
--- Snapshot of g/a and g/b through SPARQL.  sparql() caches each translation
--- per backend, and a cached variable-predicate query does not read a dedicated
--- VP table created after it was cached, so the cache is reset first.
+-- Snapshot of g/a and g/b through SPARQL.  The same variable-predicate query
+-- is reused from the plan cache after the plain path creates dedicated VP
+-- tables, so the snapshot also checks that new tables invalidate it.
 CREATE TEMP TABLE cyc_got (p text, s text, o text, g text);
 CREATE FUNCTION pg_temp.cyc_snapshot() RETURNS bigint LANGUAGE sql AS $$
-    SELECT pg_ripple.plan_cache_reset();
     DELETE FROM cyc_got;
     INSERT INTO cyc_got
     SELECT substring(t.r->>'p' FROM '^<https://cyc[.]test/(.*)>$'),
@@ -208,24 +207,19 @@ WHERE r.p = 'runs_p'
 EXCEPT
 SELECT * FROM cyc_expected;
 
--- The plain path runs each rule once, and its strata put the non-recursive
--- indirect_p rule (stratum 0) before the recursive dep_p rule: the first pass
--- completes dep_p and cause_p, and indirect_p only joins the asserted dep_p
--- edges (190 short).  The second pass completes it; the third adds nothing.
--- Its inferred copies of asserted dep_p and cause_p rows also show twice in a
--- variable-predicate scan (duplicates = 250).  Both predate this fix.
+-- One plain pass in stratum order completes all three predicates (dep_p before
+-- indirect_p): the second pass adds nothing.  The plain path still copies the
+-- asserted dep_p and cause_p rows, left in vp_rare when it creates the
+-- predicate's dedicated table, into that table as inferred: a
+-- variable-predicate scan sees them twice (duplicates = 250).
 SELECT pg_ripple.infer('cyc_prodp') >= 0 AS plain_first_pass;
 SELECT pg_temp.cyc_snapshot() - (SELECT count(*) FROM cyc_expected) AS short_of_expected;
 SELECT p, g, count(DISTINCT (s, o)) AS triples FROM cyc_got WHERE p LIKE '%\_p' GROUP BY p, g ORDER BY p, g;
 SELECT * FROM cyc_check;
 
 SELECT pg_ripple.infer('cyc_prodp') >= 0 AS plain_second_pass;
-SELECT pg_temp.cyc_snapshot() - (SELECT count(*) FROM cyc_expected) AS short_of_expected;
+SELECT pg_temp.cyc_snapshot() - (SELECT count(*) FROM cyc_expected) AS second_pass_added;
 SELECT * FROM cyc_check;
-
--- Third plain pass: not one triple added.
-SELECT pg_ripple.infer('cyc_prodp') >= 0 AS plain_third_pass;
-SELECT pg_temp.cyc_snapshot() - (SELECT count(*) FROM cyc_expected) AS third_pass_added;
 
 -- ── Plain path on link (rules with a base atom) and bounded depth ─────────────
 

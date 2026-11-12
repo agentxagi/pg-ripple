@@ -56,7 +56,10 @@ mod tests {
             "on-demand CTE still has a CYCLE clause: {cte}"
         );
 
-        Spi::run("SET LOCAL statement_timeout = '10s'").unwrap();
+        // The pg_test already runs inside one statement: a statement_timeout set
+        // here would not apply to it, a temp_file_limit does (path enumeration
+        // spills to temp files).
+        Spi::run("SET LOCAL temp_file_limit = '256MB'").unwrap();
         let (rows, pairs) = Spi::get_two::<i64, i64>(&format!(
             "{cte} SELECT count(*), count(DISTINCT (s, o, g)) FROM derived_{pred_id}"
         ))
