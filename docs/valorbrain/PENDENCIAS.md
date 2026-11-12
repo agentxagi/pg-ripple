@@ -120,3 +120,21 @@ Num build incremental, a linha `loaded (release build, … git <sha>)` do log e 
 Achado na revisão do #37.
 
 Na suíte, cada teste roda uma vez num banco novo, então nada quebra hoje. Mas, ao contrário do `v0147g` e do `v0147h`, o `v0147d` não passa numa segunda rodada no mesmo banco, o que atrapalha quem repete o teste para medir. A causa não foi investigada.
+
+## 10. Depois de um restart, delta não vazio só é mergeado quando chega uma escrita nova
+
+Visto na segunda janela de módulos (12/11/2026, main 68011562).
+
+- O ciclo do trabalhador sai logo no começo quando `shmem::delta_is_empty()` dá verdadeiro (`src/worker.rs:540`). Essa função só olha o contador em memória `TOTAL_DELTA_ROWS` (`src/shmem.rs:247-268`), que zera no restart e só sobe em `record_delta_inserts`. Quem chama `record_delta_inserts` é o `insert_triple` e as cargas em lote (`src/storage/ops/mod.rs:130`, `241`, `339`, `510`; `src/storage/ops/dedup.rs:159`).
+- A inferência não incrementa o contador. O INSERT do caminho simples (`compile_single_rule`, `src/datalog/compiler/rule.rs:46`) e a materialização do semi-naive (`materialise_derived_rows`, `src/datalog/seminaive.rs:37`) gravam no `vp_{id}_delta` por SQL e não chamam `record_delta_inserts`. Um delta que só cresce por inferência só é mergeado quando chega alguma escrita contada, e cada merge zera o contador de novo (`src/worker.rs:714`, `src/storage/merge.rs:965`).
+- **Medição:** depois do restart das 12:27, o contador estava em 0 com 41.259 linhas no `vp_534_delta`. O trabalhador releu o `merge_threshold` no SIGHUP, mas não olhou as tabelas. Às 12:36 o motor gravou 22 triplas, o contador saiu de 0, e o ciclo seguinte fez o merge (41.259 → 0 linhas no delta, fecho igual).
+- **Conserto sugerido:** no primeiro ciclo depois de subir e depois de um SIGHUP, avaliar os deltas uma vez sem depender do contador, ou iniciar o contador com uma contagem limitada das tabelas de delta. Além disso, fazer a inferência chamar `record_delta_inserts` com o número de linhas gravadas.
+
+## 11. Roteiro de janela: o modo `limite-padrao` precisa de uma pré-condição sobre o contador
+
+Visto na mesma janela.
+
+- Na primeira tentativa, o `limite-padrao` do roteiro (`/var/backups/janela-modulos-2026-11b/janela.sh`) falhou com "o trabalhador não leu o valor novo". Nesse caso a mensagem está errada: o trabalhador releu o limite (logou o SIGHUP), mas o ciclo saiu cedo porque o contador estava zerado (item 10).
+- Para a próxima janela:
+  - exigir `pg_ripple.stats()->>'unmerged_delta_rows' > 0` antes do RESET; é o mesmo contador (`src/stats_admin.rs:354`);
+  - trocar a mensagem por uma que separe "não releu o limite" de "não havia escrita contada".
